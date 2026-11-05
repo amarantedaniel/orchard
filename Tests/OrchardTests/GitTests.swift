@@ -73,6 +73,38 @@ struct GitTests {
         #expect(!FileManager.default.fileExists(atPath: worktree.path))
     }
 
+    @Test func listsCommitsSinceLastDeploy() async throws {
+        let repo = try TemporaryDirectory()
+        try await git(["init", "--initial-branch=main"], in: repo.url)
+        let deployed = try await commit("Deployed", in: repo.url)
+        let second = try await commit("Second", in: repo.url)
+        let third = try await commit("Third: with | separators", in: repo.url)
+
+        let changes = try #require(await Git.changes(from: deployed, to: third, in: repo.url))
+        #expect(changes.map(\.sha) == [third, second])
+        #expect(changes.map(\.subject) == ["Third: with | separators", "Second"])
+        #expect(changes.allSatisfy { $0.author == "Orchard Tests" })
+
+        #expect(await Git.changes(from: third, to: third, in: repo.url) == [])
+        #expect(await Git.changes(from: String(repeating: "0", count: 40), to: third, in: repo.url) == nil)
+        // Rollback, or a force-push that dropped commits: the list couldn't show what was removed.
+        #expect(await Git.changes(from: third, to: second, in: repo.url) == nil)
+        try await git(["checkout", "-q", "-b", "rewritten", deployed], in: repo.url)
+        let rewritten = try await commit("Rewritten", in: repo.url)
+        #expect(await Git.changes(from: third, to: rewritten, in: repo.url) == nil)
+    }
+
+    @Test func capsChangesOneAboveTheLimit() async throws {
+        let repo = try TemporaryDirectory()
+        try await git(["init", "--initial-branch=main"], in: repo.url)
+        let base = try await commit("Base", in: repo.url)
+        var head = base
+        for i in 0..<Git.changesLimit { head = try await commit("Change \(i)", in: repo.url) }
+        #expect(await Git.changes(from: base, to: head, in: repo.url)?.count == Git.changesLimit)
+        for i in 0..<2 { head = try await commit("More \(i)", in: repo.url) }
+        #expect(await Git.changes(from: base, to: head, in: repo.url)?.count == Git.changesLimit + 1)
+    }
+
     @discardableResult
     private func git(_ arguments: [String], in directory: URL) async throws -> String {
         let identity = ["-c", "user.name=Orchard Tests", "-c", "user.email=tests@example.com",
