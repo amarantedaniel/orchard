@@ -24,6 +24,19 @@ struct DeployOutcomeTests {
             == .failed("1 of 2 device(s) failed"))
     }
 
+    @Test func onlyAFailedLaunchCommandMeansInstalledNotLaunched() async {
+        let locked = ShellError(command: "devicectl", status: 1, output: "BSErrorCodeDescription = Locked\n")
+        await #expect(throws: DeployError.launchFailed("the device was locked")) {
+            try await Deployer.launching { throw locked }
+        }
+        await #expect(throws: CancellationError.self) {
+            try await Deployer.launching { throw CancellationError() }
+        }
+        await #expect(throws: CocoaError.self) {
+            try await Deployer.launching { throw CocoaError(.fileNoSuchFile) }
+        }
+    }
+
     @Test func explainsALockedDevice() {
         // devicectl's output when the phone is locked (trimmed).
         let locked = """

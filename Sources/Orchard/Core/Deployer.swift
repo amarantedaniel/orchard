@@ -29,7 +29,7 @@ enum Deployer {
     }
 
     /// Runs a launch command after a successful install, so its failure means "installed, not launched".
-    private static func launching(_ launch: () async throws -> Void) async throws {
+    static func launching(_ launch: () async throws -> Void) async throws {
         do {
             try await launch()
         } catch let error as ShellError {
@@ -69,7 +69,7 @@ enum Deployer {
     }
 }
 
-enum DeployError: LocalizedError {
+enum DeployError: LocalizedError, Equatable {
     /// The app was installed, but launching it failed.
     case launchFailed(String)
 

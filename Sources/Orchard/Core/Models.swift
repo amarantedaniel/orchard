@@ -123,7 +123,7 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     var pollInterval: TimeInterval = 60
     var isEnabled = false
 
-    /// Last commit successfully deployed to every device.
+    /// Last commit installed on every device (launching it may have failed, e.g. on a locked phone).
     var lastDeployedCommit: String?
     var lastDeployedAt: Date?
     /// Last commit a run was attempted for, so a broken commit isn't rebuilt on every poll.
