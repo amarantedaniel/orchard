@@ -87,6 +87,23 @@ enum Git {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static let changesLimit = 50
+
+    /// Commits since `base`, newest first, at most `changesLimit + 1` so callers can tell there are more.
+    /// Nil unless `commit` descends from `base`: after a force-push, rollback or branch switch,
+    /// `base..commit` wouldn't show what was dropped.
+    static func changes(from base: String, to commit: String, in repo: URL) async -> [CommitSummary]? {
+        guard (try? await Shell.git(["merge-base", "--is-ancestor", base, commit], in: repo)) != nil,
+              let output = try? await Shell.git(
+            ["log", "--max-count=\(changesLimit + 1)", "--format=%H%x1f%an%x1f%s", "\(base)..\(commit)"], in: repo)
+        else { return nil }
+        return output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\u{1F}", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else { return nil }
+            return CommitSummary(sha: String(fields[0]), author: String(fields[1]), subject: String(fields[2]))
+        }
+    }
+
     static func removeWorktree(at worktree: URL, repo: URL) async {
         _ = try? await Shell.git(["worktree", "remove", "--force", worktree.path], in: repo)
         try? FileManager.default.removeItem(at: worktree)

@@ -147,10 +147,21 @@ enum DeployOutcome: Equatable, Sendable {
     case failed(String)
 }
 
+struct CommitSummary: Identifiable, Hashable, Sendable {
+    var sha: String
+    var author: String
+    var subject: String
+    var id: String { sha }
+}
+
 struct RunRecord: Identifiable, Sendable {
     let id = UUID()
     var commit: String
     var subject: String?
+    /// Commit deployed before this run, which `changes` are counted from.
+    var baseCommit: String?
+    /// Commits since `baseCommit`, newest first; nil when unknown (first deploy, or git couldn't tell).
+    var changes: [CommitSummary]?
     var startedAt = Date()
     var finishedAt: Date?
     var outcome: DeployOutcome = .running

@@ -82,6 +82,47 @@ struct ContentViewLayoutTests {
                 }
                 try harness.snapshot(to: directory.appendingPathComponent("\(state)-\(name).png"))
             }
+
+            let store = makeTestStore()
+            let runner = store.pipelines[0]
+            let iPhone = Device(id: "iphone", name: "iPhone", model: "iPhone 17 Pro", kind: .physical,
+                                platform: .iOS, osVersion: "26.0")
+            runner.config.devices = [iPhone]
+            runner.runs = sampleRuns(device: iPhone.id)
+            let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+            defer { harness.close() }
+            harness.window.title = runner.config.name
+            try harness.snapshot(to: directory.appendingPathComponent("deploys-\(name).png"))
+            // Expand the latest deploy's changes: click its "3 commits since …" toggle.
+            func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+            let table = try #require(views(harness.window.contentView!).compactMap { $0 as? NSTableView }.first)
+            let row = table.convert(table.rect(ofRow: 1), to: nil)  // Row 0 is the section header.
+            let point = NSPoint(x: row.minX + 40, y: row.minY + 8)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                harness.window.sendEvent(try #require(NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: 0,
+                    windowNumber: harness.window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1)))
+            }
+            harness.settle()
+            try harness.snapshot(to: directory.appendingPathComponent("deploys-expanded-\(name).png"))
         }
+    }
+
+    private func sampleRuns(device: String) -> [RunRecord] {
+        func sha(_ seed: Character) -> String { String(repeating: seed, count: 40) }
+        var latest = RunRecord(commit: sha("c"), subject: "Merge feature/search", baseCommit: sha("a"))
+        latest.changes = [
+            CommitSummary(sha: sha("c"), author: "Ada Lovelace", subject: "Merge feature/search"),
+            CommitSummary(sha: sha("b"), author: "Ada Lovelace", subject: "Debounce search queries"),
+            CommitSummary(sha: sha("9"), author: "Alan Turing", subject: "Add a search field to the flight list"),
+        ]
+        latest.outcome = .succeeded
+        latest.deviceOutcomes = [device: .succeeded]
+        var previous = RunRecord(commit: sha("a"), subject: "Fix crash on launch", baseCommit: sha("8"))
+        previous.changes = [CommitSummary(sha: sha("a"), author: "Alan Turing", subject: "Fix crash on launch")]
+        previous.outcome = .succeeded
+        previous.deviceOutcomes = [device: .succeeded]
+        return [latest, previous]
     }
 }
