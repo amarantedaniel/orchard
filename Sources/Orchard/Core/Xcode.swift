@@ -74,7 +74,13 @@ enum Xcode {
             common += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
         }
 
-        try await Shell.run("/usr/bin/xcodebuild", common + ["build"], in: checkout, onLine: log)
+        // Deploys don't need dSYMs, and generating one for a large app takes tens of seconds.
+        try await Shell.run("/usr/bin/xcodebuild", common + ["DEBUG_INFORMATION_FORMAT=dwarf", "build"],
+                            in: checkout, onLine: log)
+
+        // `-showBuildSettings` reloads the whole workspace, which can take a minute for big ones.
+        let products = productsDirectory(derivedData: derivedData, configuration: configuration, platform: platform)
+        if let product = builtApp(in: products) { return product }
 
         let settingsOutput = try await Shell.run(
             "/usr/bin/xcodebuild", common + ["-showBuildSettings", "-json"], in: checkout)
@@ -98,6 +104,24 @@ enum Xcode {
             throw XcodeError.productMissing(url)
         }
         return BuiltProduct(appURL: url, bundleIdentifier: bundleID)
+    }
+
+    /// Where xcodebuild puts products by default for `-derivedDataPath`.
+    static func productsDirectory(derivedData: URL, configuration: String, platform: BuildPlatform) -> URL {
+        let name = platform == .macOS ? configuration : "\(configuration)-\(platform.platformName)"
+        return derivedData.appendingPathComponent("Build/Products/\(name)", isDirectory: true)
+    }
+
+    /// The only .app in `products`, with its bundle ID. Nil when there are none or several
+    /// (e.g. after switching schemes), so the caller asks xcodebuild instead.
+    static func builtApp(in products: URL) -> BuiltProduct? {
+        let apps = (try? FileManager.default.contentsOfDirectory(at: products, includingPropertiesForKeys: nil))?
+            .filter { $0.pathExtension == "app" } ?? []
+        guard apps.count == 1, let app = apps.first else { return nil }
+        let info = ["Contents/Info.plist", "Info.plist"].lazy
+            .compactMap { NSDictionary(contentsOf: app.appendingPathComponent($0)) }.first
+        guard let bundleID = info?["CFBundleIdentifier"] as? String else { return nil }
+        return BuiltProduct(appURL: app, bundleIdentifier: bundleID)
     }
 
     /// xcodebuild may print warnings before its JSON; skip to the first line that opens it.
