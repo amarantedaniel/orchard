@@ -29,7 +29,7 @@ Orchard keeps running in the menu bar after the window closes.
 ## How it works
 
 - **Checkout:** a private detached `git worktree` per pipeline in `~/Library/Application Support/Orchard/Pipelines/<id>/` — your own checkout is never touched (other than `git fetch`).
-- **Build:** one `xcodebuild build` per platform (`generic/platform=iOS`, `platform=macOS`, …) with automatic signing (`-allowProvisioningUpdates`), so all iPhones and iPads share one build.
+- **Build:** one `xcodebuild build` per platform (`generic/platform=iOS`, `platform=macOS`, …) with automatic signing (`-allowProvisioningUpdates`), so all iPhones and iPads share one build. Builds are incremental (each pipeline keeps its own DerivedData) and skip dSYMs (`DEBUG_INFORMATION_FORMAT=dwarf`), which deploys don't need. A build phase that requires a dSYM, such as a strict crash-reporter upload script, won't find one.
 - **Deploy:** `devicectl device install app` + `process launch --terminate-existing` for devices, `simctl install/launch` for simulators, quit + `open` for this Mac.
 - A commit that fails isn't retried on every poll; push a new one or use **Build & Deploy Now**.
 - Each deploy lists the commits it brings in since the last successful deploy (`git log <last>..<new>`, up to 50). Nothing is listed when the new commit doesn't descend from the last one (force-push, rollback, branch switch).
