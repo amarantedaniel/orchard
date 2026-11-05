@@ -77,7 +77,7 @@ private struct RunRow: View {
                     } icon: {
                         OutcomeIcon(outcome: outcome).imageScale(.small)
                     }
-                    .help(outcome.failureMessage ?? device.name)
+                    .help(outcome.message ?? device.name)
                 }
             }
             if let changes = run.changes, !changes.isEmpty, let base = run.baseCommit {
@@ -89,10 +89,10 @@ private struct RunRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
-            if case .failed(let message) = run.outcome {
+            if let message = run.outcome.message {
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(run.outcome == .failed(message) ? .red : .orange)
                     .lineLimit(3)
             }
         }
@@ -133,6 +133,8 @@ struct OutcomeIcon: View {
             ProgressView().controlSize(.mini)
         case .succeeded:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .warning:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
@@ -140,8 +142,11 @@ struct OutcomeIcon: View {
 }
 
 extension DeployOutcome {
-    var failureMessage: String? {
-        if case .failed(let message) = self { message } else { nil }
+    var message: String? {
+        switch self {
+        case .warning(let message), .failed(let message): message
+        default: nil
+        }
     }
 }
 

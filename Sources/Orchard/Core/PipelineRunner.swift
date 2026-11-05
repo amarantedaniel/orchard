@@ -204,6 +204,9 @@ final class PipelineRunner: Identifiable {
                         append(.success, "Launched on \(device.name)")
                     } catch is CancellationError {
                         throw CancellationError()
+                    } catch let error as DeployError {
+                        update { $0.deviceOutcomes[device.id] = .warning(error.localizedDescription) }
+                        append(.warning, "\(device.name): \(error.localizedDescription)")
                     } catch {
                         let message = (error as? ShellError).map { lastMeaningfulLine($0.output) }
                             ?? error.localizedDescription
@@ -213,20 +216,25 @@ final class PipelineRunner: Identifiable {
                 }
             }
 
-            let failures = runs.first(where: { $0.id == record.id })?.deviceOutcomes.values
-                .filter { if case .failed = $0 { true } else { false } }.count ?? 0
-            if failures == 0 {
+            let outcome = runs.first(where: { $0.id == record.id })?.finalOutcome(devices: config.devices)
+                ?? .succeeded
+            update { $0.outcome = outcome }
+            switch outcome {
+            case .failed(let summary):
+                append(.error, summary)
+                Notifier.post(title: "\(config.name) failed", body: "\(commit.shortSHA): \(summary)")
+            case .warning(let summary):
+                // The build is on every device, so it counts as deployed.
                 self.config.lastDeployedCommit = commit
                 self.config.lastDeployedAt = Date()
-                update { $0.outcome = .succeeded }
+                append(.warning, summary)
+                Notifier.post(title: "Installed \(config.name)", body: "\(commit.shortSHA): \(summary)")
+            default:
+                self.config.lastDeployedCommit = commit
+                self.config.lastDeployedAt = Date()
                 append(.success, "Deployed \(commit.shortSHA) to \(config.devices.count) device(s)")
                 Notifier.post(title: "Deployed \(config.name)",
                               body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
-            } else {
-                let summary = "\(failures) of \(config.devices.count) device(s) failed"
-                update { $0.outcome = .failed(summary) }
-                append(.error, summary)
-                Notifier.post(title: "\(config.name) failed", body: "\(commit.shortSHA): \(summary)")
             }
         } catch is CancellationError {
             update { $0.outcome = .failed("Cancelled") }

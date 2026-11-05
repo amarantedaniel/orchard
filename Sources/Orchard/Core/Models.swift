@@ -144,6 +144,8 @@ enum DeployOutcome: Equatable, Sendable {
     case pending
     case running
     case succeeded
+    /// Installed, but launching it failed (e.g. the device was locked).
+    case warning(String)
     case failed(String)
 }
 
@@ -167,6 +169,21 @@ struct RunRecord: Identifiable, Sendable {
     var outcome: DeployOutcome = .running
     var deviceOutcomes: [String: DeployOutcome] = [:]
     var logFile: URL?
+
+    /// The run's outcome once every device is done: failed if any device failed, otherwise a
+    /// warning naming the devices the app was installed on but not launched.
+    func finalOutcome(devices: [Device]) -> DeployOutcome {
+        func matching(_ isMatch: (DeployOutcome) -> Bool) -> [Device] {
+            devices.filter { deviceOutcomes[$0.id].map(isMatch) ?? false }
+        }
+        let failed = matching { if case .failed = $0 { true } else { false } }
+        if !failed.isEmpty { return .failed("\(failed.count) of \(devices.count) device(s) failed") }
+        let notLaunched = matching { if case .warning = $0 { true } else { false } }
+        if !notLaunched.isEmpty {
+            return .warning("Installed, but failed to launch on \(notLaunched.map(\.name).joined(separator: ", "))")
+        }
+        return .succeeded
+    }
 }
 
 struct LogLine: Identifiable, Sendable {

@@ -121,8 +121,8 @@ struct ContentViewLayoutTests {
         latest.deviceOutcomes = [device: .succeeded]
         var previous = RunRecord(commit: sha("a"), subject: "Fix crash on launch", baseCommit: sha("8"))
         previous.changes = [CommitSummary(sha: sha("a"), author: "Alan Turing", subject: "Fix crash on launch")]
-        previous.outcome = .succeeded
-        previous.deviceOutcomes = [device: .succeeded]
+        previous.outcome = .warning("Installed, but failed to launch on iPhone")
+        previous.deviceOutcomes = [device: .warning("Installed, but failed to launch: the device was locked")]
         return [latest, previous]
     }
 }
