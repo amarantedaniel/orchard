@@ -126,6 +126,7 @@ struct StatusDot: View {
         if runner.status.isBusy { return .blue }
         if !runner.config.isEnabled { return .secondary.opacity(0.5) }
         if case .failed = runner.lastRun?.outcome { return .red }
+        if case .warning = runner.lastRun?.outcome { return .orange }
         if runner.lastError != nil { return .orange }
         return .green
     }

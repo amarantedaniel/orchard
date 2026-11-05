@@ -47,7 +47,7 @@ docs/                         README screenshots (light/dark), app-icon/ preview
 2. If the head isn't `lastDeployedCommit` or `lastAttemptedCommit`, it runs. A failed commit isn't retried until a new commit lands or the user hits Build & Deploy Now.
 3. It checks the commit out into Orchard's own detached worktree at `~/Library/Application Support/Orchard/Pipelines/<id>/checkout`, never in the user's clone.
 4. It runs one `xcodebuild build` per `BuildPlatform` among the chosen devices (generic destination, so all iPhones share one build), with `DEBUG_INFORMATION_FORMAT=dwarf` (no dSYMs). It takes the one `.app` in the default products folder that this build signed (`Xcode.builtApp`; leftovers from earlier schemes aren't re-signed), and reads `-showBuildSettings -json` only when there isn't exactly one, because that reloads the workspace and takes up to a minute on big projects.
-5. It deploys to each device of that platform with `Deployer`. Per-device outcomes go into a `RunRecord`, and the full log goes to `~/Library/Logs/Orchard/<id>/`.
+5. It deploys to each device of that platform with `Deployer`. Per-device outcomes go into a `RunRecord`, and the full log goes to `~/Library/Logs/Orchard/<id>/`. A launch that fails after a successful install (a locked phone) is a `.warning`, not a failure: the run still counts as deployed (`RunRecord.finalOutcome`).
 
 ## Build, run, test
 
@@ -62,7 +62,7 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
 - `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. `makeTestStore()` gives an in-memory `AppStore` without device discovery; never build one on `.standard` in tests.
 - `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list. The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
