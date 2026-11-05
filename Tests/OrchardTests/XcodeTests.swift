@@ -33,30 +33,55 @@ struct XcodeTests {
             == "/DD/Build/Products/Debug")
     }
 
-    @Test func findsTheOnlyBuiltApp() throws {
+    @Test func findsTheAppThisBuildSigned() throws {
+        let buildStart = Date()
         let products = try TemporaryDirectory()
-        #expect(Xcode.builtApp(in: products.url.appendingPathComponent("Missing")) == nil)
+        #expect(Xcode.builtApp(in: products.url.appendingPathComponent("Missing"), signedSince: buildStart) == nil)
 
-        try products.makeDirectories("Phone.app", "Widget.appex", "Phone.app.dSYM")
-        #expect(Xcode.builtApp(in: products.url) == nil) // no Info.plist
-        try plist(bundleID: "com.example.phone", at: products.url.appendingPathComponent("Phone.app/Info.plist"))
-        let phone = try #require(Xcode.builtApp(in: products.url))
+        try products.makeDirectories("Widget.appex", "Phone.app.dSYM")
+        try app("Phone", bundleID: "com.example.phone", in: products, signedAt: Date())
+        let phone = try #require(Xcode.builtApp(in: products.url, signedSince: buildStart))
         #expect(phone.appURL.lastPathComponent == "Phone.app")
         #expect(phone.bundleIdentifier == "com.example.phone")
 
-        try products.makeDirectories("Other.app")
-        #expect(Xcode.builtApp(in: products.url) == nil) // ambiguous
+        // Left over from an earlier scheme: not signed by this build, so ignored.
+        try app("Old", bundleID: "com.example.old", in: products, signedAt: buildStart.addingTimeInterval(-3600))
+        #expect(Xcode.builtApp(in: products.url, signedSince: buildStart)?.bundleIdentifier == "com.example.phone")
+
+        // A no-op build re-signs nothing; two apps signed by one build are ambiguous.
+        #expect(Xcode.builtApp(in: products.url, signedSince: Date().addingTimeInterval(60)) == nil)
+        try app("Clip", bundleID: "com.example.clip", in: products, signedAt: Date())
+        #expect(Xcode.builtApp(in: products.url, signedSince: buildStart) == nil)
+
+        // The build now lands elsewhere (e.g. a custom CONFIGURATION_BUILD_DIR): the only app is stale.
+        let stale = try TemporaryDirectory()
+        try app("Phone", bundleID: "com.example.phone", in: stale, signedAt: buildStart.addingTimeInterval(-3600))
+        #expect(Xcode.builtApp(in: stale.url, signedSince: buildStart) == nil)
+
+        // Unsigned: can't tell it's fresh.
+        let unsigned = try TemporaryDirectory()
+        try unsigned.makeDirectories("Phone.app")
+        try plist(["CFBundleIdentifier": "com.example.phone"], at: unsigned.url.appendingPathComponent("Phone.app/Info.plist"))
+        #expect(Xcode.builtApp(in: unsigned.url, signedSince: buildStart) == nil)
 
         let mac = try TemporaryDirectory()
-        try mac.makeDirectories("Mac.app/Contents")
-        try plist(bundleID: "com.example.mac", at: mac.url.appendingPathComponent("Mac.app/Contents/Info.plist"))
-        #expect(Xcode.builtApp(in: mac.url)?.bundleIdentifier == "com.example.mac")
+        try app("Mac", bundleID: "com.example.mac", in: mac, signedAt: Date(), contents: "Contents/")
+        #expect(Xcode.builtApp(in: mac.url, signedSince: buildStart)?.bundleIdentifier == "com.example.mac")
     }
 
-    private func plist(bundleID: String, at url: URL) throws {
-        let data = try PropertyListSerialization.data(
-            fromPropertyList: ["CFBundleIdentifier": bundleID], format: .xml, options: 0)
-        try data.write(to: url)
+    /// A minimal signed bundle: Info.plist and _CodeSignature/CodeResources dated `signedAt`.
+    private func app(_ name: String, bundleID: String, in directory: TemporaryDirectory, signedAt: Date,
+                     contents: String = "") throws {
+        let root = "\(name).app/\(contents)"
+        try directory.makeDirectories(root + "_CodeSignature")
+        try plist(["CFBundleIdentifier": bundleID], at: directory.url.appendingPathComponent(root + "Info.plist"))
+        let resources = directory.url.appendingPathComponent(root + "_CodeSignature/CodeResources")
+        try plist([:], at: resources)
+        try FileManager.default.setAttributes([.modificationDate: signedAt], ofItemAtPath: resources.path)
+    }
+
+    private func plist(_ dictionary: [String: String], at url: URL) throws {
+        try PropertyListSerialization.data(fromPropertyList: dictionary, format: .xml, options: 0).write(to: url)
     }
 
     @Test func containerDisplayName() {

@@ -75,12 +75,13 @@ enum Xcode {
         }
 
         // Deploys don't need dSYMs, and generating one for a large app takes tens of seconds.
+        let buildStart = Date()
         try await Shell.run("/usr/bin/xcodebuild", common + ["DEBUG_INFORMATION_FORMAT=dwarf", "build"],
                             in: checkout, onLine: log)
 
         // `-showBuildSettings` reloads the whole workspace, which can take a minute for big ones.
         let products = productsDirectory(derivedData: derivedData, configuration: configuration, platform: platform)
-        if let product = builtApp(in: products) { return product }
+        if let product = builtApp(in: products, signedSince: buildStart) { return product }
 
         let settingsOutput = try await Shell.run(
             "/usr/bin/xcodebuild", common + ["-showBuildSettings", "-json"], in: checkout)
@@ -112,16 +113,24 @@ enum Xcode {
         return derivedData.appendingPathComponent("Build/Products/\(name)", isDirectory: true)
     }
 
-    /// The only .app in `products`, with its bundle ID. Nil when there are none or several
-    /// (e.g. after switching schemes), so the caller asks xcodebuild instead.
-    static func builtApp(in products: URL) -> BuiltProduct? {
+    /// The one .app in `products` that was signed since `date`, i.e. by the build that just ran.
+    /// Apps left over from earlier schemes or build settings aren't re-signed, so they're ignored.
+    /// Nil when there's none (a no-op or unsigned build, a custom build folder) or several, so the
+    /// caller asks xcodebuild instead.
+    static func builtApp(in products: URL, signedSince date: Date) -> BuiltProduct? {
         let apps = (try? FileManager.default.contentsOfDirectory(at: products, includingPropertiesForKeys: nil))?
-            .filter { $0.pathExtension == "app" } ?? []
+            .filter { $0.pathExtension == "app" && (signingDate(of: $0).map { $0 >= date } ?? false) } ?? []
         guard apps.count == 1, let app = apps.first else { return nil }
         let info = ["Contents/Info.plist", "Info.plist"].lazy
             .compactMap { NSDictionary(contentsOf: app.appendingPathComponent($0)) }.first
         guard let bundleID = info?["CFBundleIdentifier"] as? String else { return nil }
         return BuiltProduct(appURL: app, bundleIdentifier: bundleID)
+    }
+
+    private static func signingDate(of app: URL) -> Date? {
+        ["Contents/_CodeSignature/CodeResources", "_CodeSignature/CodeResources"].lazy.compactMap {
+            try? FileManager.default.attributesOfItem(atPath: app.appendingPathComponent($0).path)[.modificationDate] as? Date
+        }.first
     }
 
     /// xcodebuild may print warnings before its JSON; skip to the first line that opens it.
