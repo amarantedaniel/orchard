@@ -89,11 +89,13 @@ enum Git {
 
     static let changesLimit = 50
 
-    /// Commits reachable from `commit` but not from `base`, newest first, at most `changesLimit`.
-    /// Nil if git can't tell, e.g. `base` is no longer in the object store.
+    /// Commits since `base`, newest first, at most `changesLimit + 1` so callers can tell there are more.
+    /// Nil unless `commit` descends from `base`: after a force-push, rollback or branch switch,
+    /// `base..commit` wouldn't show what was dropped.
     static func changes(from base: String, to commit: String, in repo: URL) async -> [CommitSummary]? {
-        guard let output = try? await Shell.git(
-            ["log", "--max-count=\(changesLimit)", "--format=%H%x1f%an%x1f%s", "\(base)..\(commit)"], in: repo)
+        guard (try? await Shell.git(["merge-base", "--is-ancestor", base, commit], in: repo)) != nil,
+              let output = try? await Shell.git(
+            ["log", "--max-count=\(changesLimit + 1)", "--format=%H%x1f%an%x1f%s", "\(base)..\(commit)"], in: repo)
         else { return nil }
         return output.split(separator: "\n").compactMap { line in
             let fields = line.split(separator: "\u{1F}", maxSplits: 2, omittingEmptySubsequences: false)

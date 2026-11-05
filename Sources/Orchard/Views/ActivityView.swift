@@ -33,7 +33,7 @@ private struct RunsList: View {
                     .listRowSeparator(isExpanded ? .hidden : .automatic, edges: .bottom)
                     // One row per commit: a List row doesn't re-measure reliably when it grows in place.
                     if isExpanded, let changes = run.changes {
-                        ForEach(changes) { CommitRow(change: $0) }
+                        ForEach(changes.prefix(Git.changesLimit)) { CommitRow(change: $0) }
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
                     }
@@ -100,7 +100,7 @@ private struct RunRow: View {
     }
 
     private func changesLabel(_ changes: [CommitSummary], base: String) -> String {
-        let count = changes.count >= Git.changesLimit ? "\(Git.changesLimit)+" : "\(changes.count)"
+        let count = changes.count > Git.changesLimit ? "\(Git.changesLimit)+" : "\(changes.count)"
         return "\(count) \(changes.count == 1 ? "commit" : "commits") since \(base.shortSHA)"
     }
 }

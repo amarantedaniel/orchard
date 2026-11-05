@@ -94,7 +94,10 @@ struct ContentViewLayoutTests {
             harness.window.title = runner.config.name
             try harness.snapshot(to: directory.appendingPathComponent("deploys-\(name).png"))
             // Expand the latest deploy's changes: click its "3 commits since …" toggle.
-            let point = NSPoint(x: 760, y: harness.window.frame.height - 140)
+            func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+            let table = try #require(views(harness.window.contentView!).compactMap { $0 as? NSTableView }.first)
+            let row = table.convert(table.rect(ofRow: 1), to: nil)  // Row 0 is the section header.
+            let point = NSPoint(x: row.minX + 40, y: row.minY + 8)
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
                 harness.window.sendEvent(try #require(NSEvent.mouseEvent(
                     with: type, location: point, modifierFlags: [], timestamp: 0,
