@@ -16,6 +16,7 @@ struct ActivityView: View {
 
 private struct RunsList: View {
     let runner: PipelineRunner
+    @State private var expanded: Set<RunRecord.ID> = []
 
     var body: some View {
         List {
@@ -25,16 +26,29 @@ private struct RunsList: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(runner.runs) { run in
-                    RunRow(run: run, devices: runner.config.devices)
+                    let isExpanded = expanded.contains(run.id)
+                    RunRow(run: run, devices: runner.config.devices, isExpanded: isExpanded) {
+                        if isExpanded { expanded.remove(run.id) } else { expanded.insert(run.id) }
+                    }
+                    .listRowSeparator(isExpanded ? .hidden : .automatic, edges: .bottom)
+                    // One row per commit: a List row doesn't re-measure reliably when it grows in place.
+                    if isExpanded, let changes = run.changes {
+                        ForEach(changes) { CommitRow(change: $0) }
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+                    }
                 }
             }
         }
+        .environment(\.defaultMinListRowHeight, 16)
     }
 }
 
 private struct RunRow: View {
     let run: RunRecord
     let devices: [Device]
+    let isExpanded: Bool
+    let toggleChanges: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -66,6 +80,15 @@ private struct RunRow: View {
                     .help(outcome.failureMessage ?? device.name)
                 }
             }
+            if let changes = run.changes, !changes.isEmpty, let base = run.baseCommit {
+                Button(action: toggleChanges) {
+                    Label(changesLabel(changes, base: base), systemImage: isExpanded ? "chevron.down" : "chevron.right")
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             if case .failed(let message) = run.outcome {
                 Text(message)
                     .font(.caption)
@@ -74,6 +97,28 @@ private struct RunRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    private func changesLabel(_ changes: [CommitSummary], base: String) -> String {
+        let count = changes.count >= Git.changesLimit ? "\(Git.changesLimit)+" : "\(changes.count)"
+        return "\(count) \(changes.count == 1 ? "commit" : "commits") since \(base.shortSHA)"
+    }
+}
+
+/// A commit a deploy brought in since the previously deployed commit.
+private struct CommitRow: View {
+    let change: CommitSummary
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(change.sha.shortSHA).monospaced().foregroundStyle(.secondary)
+            Text(change.subject).lineLimit(1)
+            Text(change.author).foregroundStyle(.tertiary).lineLimit(1)
+        }
+        .font(.caption)
+        .padding(.leading, 18)
+        .help(change.subject)
+        .textSelection(.enabled)
     }
 }
 

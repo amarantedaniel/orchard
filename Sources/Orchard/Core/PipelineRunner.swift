@@ -42,7 +42,7 @@ final class PipelineRunner: Identifiable {
     }
     private(set) var status: Status = .disabled
     private(set) var log: [LogLine] = []
-    private(set) var runs: [RunRecord] = []
+    var runs: [RunRecord] = []
     private(set) var lastCheck: Date?
     private(set) var nextCheck: Date?
     private(set) var lastError: String?
@@ -142,7 +142,7 @@ final class PipelineRunner: Identifiable {
         self.config.lastAttemptedCommit = commit
 
         let logFile = LogFile(pipeline: config, commit: commit)
-        var record = RunRecord(commit: commit, logFile: logFile.url)
+        var record = RunRecord(commit: commit, baseCommit: config.lastDeployedCommit, logFile: logFile.url)
         for device in config.devices { record.deviceOutcomes[device.id] = .pending }
         runs.insert(record, at: 0)
         if runs.count > 50 { runs.removeLast() }
@@ -163,6 +163,10 @@ final class PipelineRunner: Identifiable {
             let subject = await Git.subject(of: commit, in: dirs.checkout)
             update { $0.subject = subject }
             if let subject { append(.info, "“\(subject)”") }
+            if let base = config.lastDeployedCommit {
+                let changes = await Git.changes(from: base, to: commit, in: dirs.checkout)
+                update { $0.changes = changes }
+            }
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
             for platform in BuildPlatform.allCases {

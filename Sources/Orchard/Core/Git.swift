@@ -87,6 +87,21 @@ enum Git {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static let changesLimit = 50
+
+    /// Commits reachable from `commit` but not from `base`, newest first, at most `changesLimit`.
+    /// Nil if git can't tell, e.g. `base` is no longer in the object store.
+    static func changes(from base: String, to commit: String, in repo: URL) async -> [CommitSummary]? {
+        guard let output = try? await Shell.git(
+            ["log", "--max-count=\(changesLimit)", "--format=%H%x1f%an%x1f%s", "\(base)..\(commit)"], in: repo)
+        else { return nil }
+        return output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\u{1F}", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else { return nil }
+            return CommitSummary(sha: String(fields[0]), author: String(fields[1]), subject: String(fields[2]))
+        }
+    }
+
     static func removeWorktree(at worktree: URL, repo: URL) async {
         _ = try? await Shell.git(["worktree", "remove", "--force", worktree.path], in: repo)
         try? FileManager.default.removeItem(at: worktree)

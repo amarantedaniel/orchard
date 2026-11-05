@@ -32,6 +32,7 @@ Orchard keeps running in the menu bar after the window closes.
 - **Build:** one `xcodebuild build` per platform (`generic/platform=iOS`, `platform=macOS`, …) with automatic signing (`-allowProvisioningUpdates`), so all iPhones and iPads share one build.
 - **Deploy:** `devicectl device install app` + `process launch --terminate-existing` for devices, `simctl install/launch` for simulators, quit + `open` for this Mac.
 - A commit that fails isn't retried on every poll; push a new one or use **Build & Deploy Now**.
+- Each deploy lists the commits it brings in since the last successful deploy (`git log <last>..<new>`, up to 50).
 - Full logs per run are in `~/Library/Logs/Orchard/<id>/`.
 
 ## Requirements
