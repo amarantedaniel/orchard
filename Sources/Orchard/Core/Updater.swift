@@ -70,36 +70,16 @@ struct Release: Decodable, Sendable {
 
     let tagName: String
     let htmlURL: URL
-    let body: String?
     let assets: [Asset]
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
         case htmlURL = "html_url"
-        case body, assets
+        case assets
     }
 
     var version: AppVersion? { AppVersion(tag: tagName) }
     var dmg: Asset? { assets.first { $0.name.hasSuffix(".dmg") } }
-
-    /// GitHub's generated notes as plain lines: no headings or "Full Changelog" footer, bullets
-    /// as "•" and PR links shortened to "(#12)".
-    var notes: String {
-        guard let body else { return "" }
-        return body
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .components(separatedBy: "\n")
-            .filter { !$0.hasPrefix("**Full Changelog**") && !$0.hasPrefix("#") }
-            .map { line in
-                var line = line
-                if line.hasPrefix("* ") || line.hasPrefix("- ") { line = "• " + line.dropFirst(2) }
-                return line.replacingOccurrences(
-                    of: #" in https://github\.com/[^/]+/[^/]+/pull/(\d+)"#, with: " (#$1)",
-                    options: .regularExpression)
-            }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
 /// Checks GitHub for a newer release, offers it in an alert and installs it in place.
@@ -213,20 +193,24 @@ final class Updater {
         guard !isPrompting else { return }
         isPrompting = true
         let canInstall = Self.installLocation() != nil && release.dmg != nil
-        let alert = Self.makeAlert(for: release, current: current, canInstall: canInstall, busy: isBusy())
-        AlertPresenter.show(alert) { [weak self] response in
+        let busy = isBusy()
+        UpdateWindow.show({ choose in
+            UpdateAvailableView(newVersion: release.version?.description ?? release.tagName,
+                                currentVersion: self.current?.description, canInstall: canInstall,
+                                busy: busy, releaseNotes: release.htmlURL, choose: choose)
+        }) { [weak self] choice in
             guard let self else { return }
             isPrompting = false
-            switch response {
-            case .alertFirstButtonReturn:
+            switch choice {
+            case .install:
                 if canInstall {
                     Task { await self.install(release) }
                 } else {
                     NSWorkspace.shared.open(release.htmlURL)
                 }
-            case .alertThirdButtonReturn:
+            case .skip:
                 defaults?.set(release.tagName, forKey: skippedKey)
-            default:
+            case .later:
                 break
             }
         }
@@ -240,46 +224,6 @@ final class Updater {
         guard let version = AppVersion(tag: tag), Self.isNewer(version, than: current) else { return }
         showError("Couldn't install the update",
                   UpdateError("Orchard \(version) was downloaded, but the app at \(Bundle.main.bundlePath) couldn't be replaced. Download it from GitHub instead."))
-    }
-
-    /// The "Update Available" alert. Built separately so tests can render it.
-    static func makeAlert(for release: Release, current: AppVersion?, canInstall: Bool, busy: Bool) -> NSAlert {
-        let alert = NSAlert()
-        alert.icon = NSApp.applicationIconImage
-        alert.messageText = "Update Available"
-        let new = release.version?.description ?? release.tagName
-        var info = "Orchard \(new) is available"
-        info += current.map { " — you have \($0)." } ?? "."
-        if canInstall && busy {
-            info += " Updating stops the build or deploy that's running now."
-        } else if !canInstall {
-            info += " Orchard can't replace itself here, so download it from GitHub."
-        }
-        alert.informativeText = info
-        alert.addButton(withTitle: canInstall ? "Install and Relaunch" : "Download…")
-        alert.addButton(withTitle: "Later")
-        alert.addButton(withTitle: "Skip This Version")
-
-        let notes = release.notes
-        if !notes.isEmpty {
-            let scroll = NSTextView.scrollableTextView()
-            scroll.frame = NSRect(x: 0, y: 0, width: 380, height: 140)
-            scroll.borderType = .lineBorder
-            let text = scroll.documentView as! NSTextView
-            text.isEditable = false
-            text.drawsBackground = false
-            text.textContainerInset = NSSize(width: 4, height: 6)
-            let options = AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .inlineOnlyPreservingWhitespace)
-            let attributed = (try? AttributedString(markdown: notes, options: options)) ?? AttributedString(notes)
-            let styled = NSMutableAttributedString(attributed)
-            styled.addAttributes([.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                                  .foregroundColor: NSColor.labelColor],
-                                 range: NSRange(location: 0, length: styled.length))
-            text.textStorage?.setAttributedString(styled)
-            alert.accessoryView = scroll
-        }
-        return alert
     }
 
     private func showUpToDate() {
@@ -436,8 +380,6 @@ final class AlertPresenter: NSObject {
             button.target = presenter
             button.action = #selector(clicked(_:))
         }
-        // Esc picks the second button ("Later"), as Cancel would.
-        if alert.buttons.count > 1 { alert.buttons[1].keyEquivalent = "\u{1b}" }
         guard display else { return }
         alert.layout()
         alert.window.center()

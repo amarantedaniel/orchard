@@ -47,10 +47,10 @@ struct UpdaterTests {
     }
 
     @Test func alertButtonsReportWhichWasClicked() throws {
-        let release = try JSONDecoder().decode(Release.self, from: Data(sampleJSON.utf8))
         var responses: [NSApplication.ModalResponse] = []
         for index in 0..<3 {
-            let alert = Updater.makeAlert(for: release, current: nil, canInstall: true, busy: false)
+            let alert = NSAlert()
+            for title in ["One", "Two", "Three"] { alert.addButton(withTitle: title) }
             AlertPresenter.show(alert, display: false) { responses.append($0) }
             alert.buttons[index].performClick(nil)
         }
@@ -99,7 +99,6 @@ struct UpdaterTests {
         let release = try JSONDecoder().decode(Release.self, from: Data(sampleJSON.utf8))
         #expect(release.version == AppVersion(tag: "v1.0.7(8)"))
         #expect(release.dmg?.name == "Orchard-1.0.7-8.dmg")
-        #expect(release.notes == "• Add update checks by @someone (#11)")
     }
 
     @Test func validatesTheDownloadedApp() throws {
@@ -156,19 +155,24 @@ struct UpdaterTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         _ = NSApplication.shared
         let release = try JSONDecoder().decode(Release.self, from: Data(sampleJSON.utf8))
+        let states: [(String, Bool, Bool)] = [("", true, false), ("-busy", true, true), ("-download", false, false)]
         for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
-            let alert = Updater.makeAlert(for: release, current: AppVersion(tag: "v1.0.6(7)"),
-                                          canInstall: true, busy: false)
-            // Lay the panel out without ordering it in: AppKit would pull it onto the screen.
-            alert.window.appearance = NSAppearance(named: appearance)
-            alert.layout()
-            let view = try #require(alert.window.contentView)
-            view.layoutSubtreeIfNeeded()
-            #expect(!alert.window.isVisible)
-            let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
-            view.cacheDisplay(in: view.bounds, to: rep)
-            try rep.representation(using: .png, properties: [:])!
-                .write(to: directory.appendingPathComponent("update-available-\(name).png"))
+            // The test process has no app icon; use the rendered previews of Orchard's.
+            let icons = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appendingPathComponent("../../docs/app-icon").standardized
+            NSApp.applicationIconImage = NSImage(contentsOf: icons.appendingPathComponent("\(name).png"))
+            for (state, canInstall, busy) in states {
+                let view = UpdateAvailableView(newVersion: "1.0.8 (9)", currentVersion: "1.0.7 (8)",
+                                               canInstall: canInstall, busy: busy,
+                                               releaseNotes: release.htmlURL) { _ in }
+                let harness = WindowHarness(view, size: NSSize(width: 460, height: 160), appearance: appearance)
+                defer { harness.close() }
+                harness.window.styleMask = [.titled, .closable]
+                harness.window.titlebarAppearsTransparent = true
+                harness.window.titleVisibility = .hidden
+                harness.settle()
+                try harness.snapshot(to: directory.appendingPathComponent("update-available\(state)-\(name).png"))
+            }
         }
     }
 
