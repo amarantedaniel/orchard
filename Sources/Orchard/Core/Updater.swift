@@ -125,6 +125,9 @@ final class Updater {
     @ObservationIgnored let current: AppVersion?
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private let skippedKey = "skippedUpdateTag"
+    /// The release an install was started for, so the next launch can tell whether it took.
+    @ObservationIgnored private let pendingKey = "pendingUpdateTag"
+    @ObservationIgnored private var isPrompting = false
     @ObservationIgnored private var loop: Task<Void, Never>?
     /// Whether a pipeline is building or deploying, so the alert can warn that updating stops it.
     @ObservationIgnored var isBusy: () -> Bool = { false }
@@ -138,6 +141,7 @@ final class Updater {
     /// bundled .app, because there's no version to compare against.
     func start() {
         guard current != nil, loop == nil else { return }
+        reportFailedInstall()
         loop = Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
             while !Task.isCancelled {
@@ -178,8 +182,14 @@ final class Updater {
 
     /// Whether `version` should be offered over `current`. Without a current version (`swift run`)
     /// any release counts, so a manual check can still point at the download.
+    /// A local `build-app.sh` build has build number 1, so it's compared by marketing version
+    /// only: the release of the version you just built isn't offered as an update.
     nonisolated static func isNewer(_ version: AppVersion, than current: AppVersion?) -> Bool {
         guard let current else { return true }
+        if current.build <= 1 {
+            return AppVersion(components: version.components, build: 0)
+                > AppVersion(components: current.components, build: 0)
+        }
         return version > current
     }
 
@@ -203,21 +213,36 @@ final class Updater {
     }
 
     private func prompt(_ release: Release) {
+        guard !isPrompting else { return }
+        isPrompting = true
         let canInstall = Self.installLocation() != nil && release.dmg != nil
         let alert = Self.makeAlert(for: release, current: current, canInstall: canInstall, busy: isBusy())
-        NSApp.activate()
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            if canInstall {
-                Task { await install(release) }
-            } else {
-                NSWorkspace.shared.open(release.htmlURL)
+        AlertPresenter.show(alert) { [weak self] response in
+            guard let self else { return }
+            isPrompting = false
+            switch response {
+            case .alertFirstButtonReturn:
+                if canInstall {
+                    Task { await self.install(release) }
+                } else {
+                    NSWorkspace.shared.open(release.htmlURL)
+                }
+            case .alertThirdButtonReturn:
+                defaults?.set(release.tagName, forKey: skippedKey)
+            default:
+                break
             }
-        case .alertThirdButtonReturn:
-            defaults?.set(release.tagName, forKey: skippedKey)
-        default:
-            break
         }
+    }
+
+    /// If the last launch quit to install an update but this is still an older version, the
+    /// swap script couldn't replace the app (for example, macOS blocked it). Say so once.
+    private func reportFailedInstall() {
+        guard let tag = defaults?.string(forKey: pendingKey) else { return }
+        defaults?.removeObject(forKey: pendingKey)
+        guard let version = AppVersion(tag: tag), Self.isNewer(version, than: current) else { return }
+        showError("Couldn't install the update",
+                  UpdateError("Orchard \(version) was downloaded, but the app at \(Bundle.main.bundlePath) couldn't be replaced. Download it from GitHub instead."))
     }
 
     /// The "Update Available" alert. Built separately so tests can render it.
@@ -264,8 +289,7 @@ final class Updater {
         let alert = NSAlert()
         alert.messageText = "You're up to date"
         alert.informativeText = "Orchard \(current?.description ?? "") is the newest version."
-        NSApp.activate()
-        alert.runModal()
+        AlertPresenter.show(alert)
     }
 
     private func showError(_ title: String, _ error: Error) {
@@ -273,8 +297,7 @@ final class Updater {
         alert.messageText = title
         alert.informativeText = error.localizedDescription
         alert.alertStyle = .warning
-        NSApp.activate()
-        alert.runModal()
+        AlertPresenter.show(alert)
     }
 
     // MARK: - Install
@@ -294,6 +317,7 @@ final class Updater {
         do {
             let staged = try await Self.download(dmg.browserDownloadURL, expecting: release.version)
             try Self.relaunch(replacing: destination, with: staged)
+            defaults?.set(release.tagName, forKey: pendingKey)
             NSApp.terminate(nil)
         } catch {
             state = .idle
@@ -307,6 +331,15 @@ final class Updater {
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrchardUpdate-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        do {
+            return try await stage(into: work, from: url, expecting: version)
+        } catch {
+            try? FileManager.default.removeItem(at: work)
+            throw error
+        }
+    }
+
+    private nonisolated static func stage(into work: URL, from url: URL, expecting version: AppVersion?) async throws -> URL {
         let dmg = work.appendingPathComponent("Orchard.dmg")
         let (downloaded, response) = try await URLSession.shared.download(from: url)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -318,13 +351,14 @@ final class Updater {
         try await Shell.run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly",
                                                  "-noautoopen", "-mountpoint", mount.path])
         let staged = work.appendingPathComponent("Orchard.app")
-        do {
+        let copied = await Result {
             try await Shell.run("/usr/bin/ditto", [mount.appendingPathComponent("Orchard.app").path, staged.path])
-        } catch {
-            _ = try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"])
-            throw error
         }
-        _ = try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path])
+        // Detach before anything can delete `work`, or the image stays mounted inside it.
+        if (try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path])) == nil {
+            try await Shell.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"])
+        }
+        _ = try copied.get()
 
         try validate(staged, expecting: version)
         try await Shell.run("/usr/bin/codesign", ["--verify", "--deep", staged.path])
@@ -363,15 +397,61 @@ final class Updater {
         while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
         work="$(dirname "$3")"
         if mv "$2" "$work/Previous.app"; then
-            if ! /usr/bin/ditto "$3" "$2"; then
+            if /usr/bin/ditto "$3" "$2"; then
+                rm -rf "$work"
+            else
+                # Put the old app back. If that fails, keep $work: it holds the only copy.
                 rm -rf "$2"
-                mv "$work/Previous.app" "$2"
+                if [ ! -e "$2" ] && mv "$work/Previous.app" "$2"; then rm -rf "$work"; fi
             fi
+        else
+            # Couldn't move the app (macOS may block it); the next launch reports it.
+            rm -rf "$work"
         fi
         /usr/bin/xattr -dr com.apple.quarantine "$2" 2>/dev/null
         "$4" "$2"
-        rm -rf "$work"
         """#
+}
+
+/// Shows an `NSAlert` as an ordinary panel instead of with `runModal()`, which would block the
+/// main actor (and with it every pipeline) until someone answers.
+@MainActor
+final class AlertPresenter: NSObject {
+    private static var open: Set<AlertPresenter> = []
+    private let alert: NSAlert
+    private let completion: (NSApplication.ModalResponse) -> Void
+
+    private init(_ alert: NSAlert, completion: @escaping (NSApplication.ModalResponse) -> Void) {
+        self.alert = alert
+        self.completion = completion
+    }
+
+    /// `display: false` wires the buttons up without putting the alert on screen (tests).
+    static func show(_ alert: NSAlert, display: Bool = true,
+                     completion: @escaping (NSApplication.ModalResponse) -> Void = { _ in }) {
+        let presenter = AlertPresenter(alert, completion: completion)
+        open.insert(presenter)
+        if alert.buttons.isEmpty { alert.addButton(withTitle: "OK") }
+        for button in alert.buttons {
+            button.target = presenter
+            button.action = #selector(clicked(_:))
+        }
+        // Esc picks the second button ("Later"), as Cancel would.
+        if alert.buttons.count > 1 { alert.buttons[1].keyEquivalent = "\u{1b}" }
+        guard display else { return }
+        alert.layout()
+        alert.window.center()
+        alert.window.level = .floating
+        NSApp.activate()
+        alert.window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func clicked(_ sender: NSButton) {
+        alert.window.orderOut(nil)
+        Self.open.remove(self)
+        // NSAlert tags its buttons 1000, 1001, … like `alertFirstButtonReturn`.
+        completion(NSApplication.ModalResponse(rawValue: sender.tag))
+    }
 }
 
 struct UpdateError: LocalizedError {

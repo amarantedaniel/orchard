@@ -37,6 +37,56 @@ struct UpdaterTests {
         #expect(Updater.isNewer(current, than: nil))
     }
 
+    @Test func localBuildsAreComparedByMarketingVersionOnly() throws {
+        // build-app.sh without BUILD_NUMBER stamps build 1.
+        let local = try #require(AppVersion(tag: "v1.0.7(1)"))
+        let sameRelease = try #require(AppVersion(tag: "v1.0.7(42)"))
+        let nextRelease = try #require(AppVersion(tag: "v1.0.8(43)"))
+        #expect(!Updater.isNewer(sameRelease, than: local))
+        #expect(Updater.isNewer(nextRelease, than: local))
+    }
+
+    @Test func alertButtonsReportWhichWasClicked() throws {
+        let release = try JSONDecoder().decode(Release.self, from: Data(sampleJSON.utf8))
+        var responses: [NSApplication.ModalResponse] = []
+        for index in 0..<3 {
+            let alert = Updater.makeAlert(for: release, current: nil, canInstall: true, busy: false)
+            AlertPresenter.show(alert, display: false) { responses.append($0) }
+            alert.buttons[index].performClick(nil)
+        }
+        #expect(responses == [.alertFirstButtonReturn, .alertSecondButtonReturn, .alertThirdButtonReturn])
+    }
+
+    @Test func swapScriptRestoresTheOldAppWhenTheCopyFails() async throws {
+        let dir = try TemporaryDirectory()
+        let installed = try makeApp(in: dir, version: "1.0.6", build: "7")
+        let work = dir.url.appendingPathComponent("work")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let missing = work.appendingPathComponent("Orchard.app")  // ditto fails: nothing to copy.
+
+        try Updater.relaunch(replacing: installed, with: missing, opener: "/usr/bin/true", waitingFor: 999_999)
+        for _ in 0..<50 where FileManager.default.fileExists(atPath: work.path) {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        let plist = try #require(NSDictionary(contentsOf: installed.appendingPathComponent("Contents/Info.plist")))
+        #expect(plist["CFBundleShortVersionString"] as? String == "1.0.6")
+    }
+
+    @Test func failedDownloadsLeaveNoTemporaryFiles() async throws {
+        let dir = try TemporaryDirectory()
+        try dir.write("not-a.dmg", "nope")
+        func leftovers() throws -> Set<String> {
+            Set(try FileManager.default.contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)
+                .filter { $0.hasPrefix("OrchardUpdate-") })
+        }
+        let before = try leftovers()
+        await #expect(throws: (any Error).self) {
+            try await Updater.download(dir.url.appendingPathComponent("not-a.dmg"), expecting: nil)
+        }
+        #expect(try leftovers() == before)
+    }
+
     @Test func readsTheCurrentVersionFromInfoPlist() throws {
         let dir = try TemporaryDirectory()
         let app = try makeApp(in: dir, version: "1.0.6", build: "7")

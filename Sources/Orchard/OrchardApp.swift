@@ -4,8 +4,17 @@ import SwiftUI
 @main
 struct OrchardApp: App {
     @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
-    @State private var store = AppStore()
-    @State private var updater = Updater()
+    @State private var store: AppStore
+    @State private var updater: Updater
+
+    init() {
+        let store = AppStore()
+        let updater = Updater()
+        updater.isBusy = { [store] in store.anyBusy }
+        updater.start()
+        _store = State(initialValue: store)
+        _updater = State(initialValue: updater)
+    }
 
     var body: some Scene {
         Window("Orchard", id: "main") {
@@ -30,11 +39,6 @@ struct OrchardApp: App {
                 .environment(updater)
         } label: {
             Image(systemName: store.anyBusy ? "arrow.triangle.2.circlepath" : "leaf")
-                .task {
-                    // The menu bar label exists from launch, even when the window is closed.
-                    updater.isBusy = { [store] in store.anyBusy }
-                    updater.start()
-                }
         }
     }
 }
