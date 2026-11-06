@@ -110,6 +110,11 @@ struct PipelineSettingsView: View {
                             .tag(seconds)
                     }
                 }
+                Picker("Keep history of", selection: Binding(
+                    get: { runner.config.keptRuns },
+                    set: { runner.config.historyLimit = $0 })) {
+                    ForEach([5, 10, 20, 50], id: \.self) { Text("Last \($0) builds").tag($0) }
+                }
                 if let commit = runner.config.lastDeployedCommit {
                     LabeledContent("Last deployed") {
                         HStack(spacing: 4) {

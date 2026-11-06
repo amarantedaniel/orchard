@@ -54,7 +54,9 @@ final class AppStore {
     }
 
     private func makeRunner(_ config: PipelineConfig) -> PipelineRunner {
-        let runner = PipelineRunner(config: config)
+        // Only the real store keeps history on disk; tests' in-memory stores leave no files behind.
+        let runner = PipelineRunner(
+            config: config, history: defaults == nil ? nil : PipelineHistory(pipeline: config.id))
         runner.onChange = { [weak self] in
             self?.save()
             self?.updateActivity()

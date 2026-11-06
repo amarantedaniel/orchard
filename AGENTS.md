@@ -18,7 +18,7 @@ Sources/Orchard/
     Models.swift              BuildPlatform, Device, PipelineConfig (persisted), RunRecord, LogLine
     AppStore.swift            @Observable root state: list of PipelineRunners, discovered devices, persistence
     PipelineRunner.swift      One pipeline: poll loop, run (checkout → build per platform → deploy per device),
-                              status, log, run history. Also Paths, LogFile, Notifier
+                              status, log, run history. Also Paths, LogFile, PipelineHistory, Notifier
     Git.swift                 Remote/branch queries via ls-remote, private worktree checkout
     Xcode.swift               Finds .xcworkspace/.xcodeproj/Package.swift, lists schemes, builds, locates the .app
     Deployer.swift            Install + launch on this Mac / physical device / simulator
@@ -50,7 +50,7 @@ docs/                         README screenshots (light/dark), app-icon/ preview
 2. If the head isn't `lastDeployedCommit` or `lastAttemptedCommit`, it runs. A failed commit isn't retried until a new commit lands or the user hits Build & Deploy Now.
 3. It checks the commit out into Orchard's own detached worktree at `~/Library/Application Support/Orchard/Pipelines/<id>/checkout`, never in the user's clone.
 4. It runs one `xcodebuild build` per `BuildPlatform` among the chosen devices (generic destination, so all iPhones share one build), with `DEBUG_INFORMATION_FORMAT=dwarf` (no dSYMs). It takes the one `.app` in the default products folder that this build signed (`Xcode.builtApp`; leftovers from earlier schemes aren't re-signed), and reads `-showBuildSettings -json` only when there isn't exactly one, because that reloads the workspace and takes up to a minute on big projects.
-5. It deploys to each device of that platform with `Deployer`. Per-device outcomes go into a `RunRecord`, and the full log goes to `~/Library/Logs/Orchard/<id>/`. A launch that fails after a successful install (a locked phone) is a `.warning`, not a failure: the run still counts as deployed (`RunRecord.finalOutcome`).
+5. It deploys to each device of that platform with `Deployer`. Per-device outcomes go into a `RunRecord`, and the full log goes to `~/Library/Logs/Orchard/<id>/`. Each phase is timed (`RunTimings`, on the `RunRecord` and in the log). `PipelineHistory` persists the runs (`runs.json`, rewritten on every change; unfinished runs load as interrupted) and the window's log (`activity.jsonl`) next to the run logs, writing on a background queue. Line caps cut at a run boundary (`keepingLines`). Both keep `config.keptRuns` builds: each check that starts a run trims the log to the previous `keptRuns - 1` runs (`keepingRuns`, by `LogLine.startsRun`), with 2000 lines as a hard cap on top. A launch that fails after a successful install (a locked phone) is a `.warning`, not a failure: the run still counts as deployed (`RunRecord.finalOutcome`).
 
 ## Build, run, test
 
@@ -65,8 +65,8 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
-- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows. It still caps its size at the screen's, as AppKit does for on-screen windows (the layout tests pass on CI only with that cap); keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` without device discovery; never build one on `.standard` in tests.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`, `PipelineHistoryTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows. It still caps its size at the screen's, as AppKit does for on-screen windows (the layout tests pass on CI only with that cap); keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` (no history on disk) without device discovery; never build one on `.standard` in tests.
 - `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list. The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
 - `GitTests` runs real `git` against temporary repos (a bare repo stands in as `origin`). Pass identity with `-c user.name=… -c user.email=…`, because CI has no global git config.
@@ -76,7 +76,7 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Rules and gotchas
 
-- **Persisted config is user data.** `PipelineConfig` is JSON-encoded into `UserDefaults` (key `pipelines`). Synthesized `Codable` ignores default values when decoding, so adding a non-optional property makes old saved data fail to decode, and every user loses their pipelines. Make new properties optional, or write a custom `init(from:)`, and add a test that decodes the old shape.
+- **Persisted config is user data.** `PipelineConfig` is JSON-encoded into `UserDefaults` (key `pipelines`). Synthesized `Codable` ignores default values when decoding, so adding a non-optional property makes old saved data fail to decode, and every user loses their pipelines. Make new properties optional, or write a custom `init(from:)`, and add a test that decodes the old shape. The same goes for `RunRecord` in `runs.json` (if it fails to decode, the file is moved to `runs-unreadable.json` and the deploy list starts empty) and `LogLine` in `activity.jsonl` (lines that don't decode are dropped).
 - **Never touch the user's checkout** beyond `git fetch`. All builds happen in the private worktree.
 - **Run every external command through `Shell`**. It provides the login-shell PATH, cancellation and log streaming. Use absolute paths for system tools (`/usr/bin/git`, `/usr/bin/xcrun`, `/usr/bin/xcodebuild`).
 - **Concurrency:** Swift 6 language mode with strict concurrency. `AppStore` and `PipelineRunner` are `@MainActor @Observable`. Log callbacks are `@Sendable` and may be called off the main actor.
