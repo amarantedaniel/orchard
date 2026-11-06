@@ -34,7 +34,7 @@ Orchard keeps running in the menu bar after the window closes.
 - A commit that fails isn't retried on every poll; push a new one or use **Build & Deploy Now**.
 - If the app installs but can't launch (for example, the phone is locked), the deploy shows a warning instead of failing and counts as deployed.
 - Each deploy lists the commits it brings in since the last successful deploy (`git log <last>..<new>`, up to 50). Nothing is listed when the new commit doesn't descend from the last one (force-push, rollback, branch switch).
-- Full logs per run are in `~/Library/Logs/Orchard/<id>/`.
+- Full logs per run are in `~/Library/Logs/Orchard/<id>/`. The deploy list and the log in the window are kept there too (`runs.json`, `activity.jsonl`), so they survive a relaunch. Both keep the last 20 builds (set per pipeline under Polling; lowering it trims right away), and both show how long checkout, build and deploy took.
 
 ## Requirements
 

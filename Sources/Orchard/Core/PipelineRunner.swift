@@ -38,11 +38,18 @@ final class PipelineRunner: Identifiable {
             guard config != oldValue else { return }
             onChange?()
             if config.isEnabled != oldValue.isEnabled { config.isEnabled ? start() : stop() }
+            if config.keptRuns < oldValue.keptRuns {
+                runs = Array(runs.prefix(config.keptRuns))
+                log = log.keepingRuns(config.keptRuns)
+                history?.replaceLog(with: log)
+            }
         }
     }
     private(set) var status: Status = .disabled
     private(set) var log: [LogLine] = []
-    var runs: [RunRecord] = []
+    var runs: [RunRecord] = [] {
+        didSet { history?.saveRuns(runs) }
+    }
     private(set) var lastCheck: Date?
     private(set) var nextCheck: Date?
     private(set) var lastError: String?
@@ -51,13 +58,22 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored var onChange: (() -> Void)?
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var runTask: Task<Void, Never>?
+    @ObservationIgnored private let history: PipelineHistory?
 
     nonisolated var id: UUID { _id }
     @ObservationIgnored private nonisolated let _id: UUID
 
-    init(config: PipelineConfig) {
+    static let maxLogLines = 2000
+
+    /// `history` keeps deploys and the log across launches; without it they live only in memory.
+    init(config: PipelineConfig, history: PipelineHistory? = nil) {
         self._id = config.id
         self.config = config
+        // Before `history` is set, so loading doesn't trigger a save (which would wipe a file
+        // that failed to decode).
+        runs = history?.loadRuns() ?? []
+        log = history?.loadLog() ?? []
+        self.history = history
         if config.isEnabled { start() }
     }
 
@@ -99,7 +115,10 @@ final class PipelineRunner: Identifiable {
         runTask?.cancel()
     }
 
-    func clearLog() { log.removeAll() }
+    func clearLog() {
+        log.removeAll()
+        history?.replaceLog(with: [])
+    }
 
     // MARK: Polling
 
@@ -120,7 +139,10 @@ final class PipelineRunner: Identifiable {
             lastError = nil
             let isNew = head != config.lastDeployedCommit && head != config.lastAttemptedCommit
             guard force || isNew else { return }
-            if !force { append(.step, "New commit on \(branch): \(head.shortSHA)") }
+            log = log.keepingRuns(config.keptRuns - 1)
+            history?.replaceLog(with: log)
+            append(.step, force ? "Deploying \(branch) @ \(head.shortSHA) on request"
+                                : "New commit on \(branch): \(head.shortSHA)", startsRun: true)
 
             let snapshot = config
             let task = Task { await self.run(commit: head, config: snapshot) }
@@ -145,7 +167,7 @@ final class PipelineRunner: Identifiable {
         var record = RunRecord(commit: commit, baseCommit: config.lastDeployedCommit, logFile: logFile.url)
         for device in config.devices { record.deviceOutcomes[device.id] = .pending }
         runs.insert(record, at: 0)
-        if runs.count > 50 { runs.removeLast() }
+        if runs.count > config.keptRuns { runs.removeLast(runs.count - config.keptRuns) }
 
         func update(_ change: (inout RunRecord) -> Void) {
             guard let index = runs.firstIndex(where: { $0.id == record.id }) else { return }
@@ -155,6 +177,8 @@ final class PipelineRunner: Identifiable {
         let raw = logger(file: logFile, condensed: false)
         let build = logger(file: logFile, condensed: true)
         let dirs = Paths.pipeline(config.id)
+        let runStart = Date()
+        var timings = RunTimings()
 
         do {
             status = .preparing
@@ -167,6 +191,8 @@ final class PipelineRunner: Identifiable {
                 let changes = await Git.changes(from: base, to: commit, in: dirs.checkout)
                 update { $0.changes = changes }
             }
+            timings.checkout = Date().timeIntervalSince(runStart)
+            update { $0.timings = timings }
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
             for platform in BuildPlatform.allCases {
@@ -175,8 +201,13 @@ final class PipelineRunner: Identifiable {
 
                 status = .building(platform)
                 append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
+                let buildStart = Date()
                 let product: BuiltProduct
                 do {
+                    defer {
+                        timings.build += Date().timeIntervalSince(buildStart)
+                        update { $0.timings = timings }
+                    }
                     product = try await Xcode.build(
                         container: config.containerPath, scheme: scheme,
                         configuration: config.configuration, platform: platform,
@@ -184,34 +215,40 @@ final class PipelineRunner: Identifiable {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    append(.error, "Build for \(platform.displayName) failed")
+                    let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
+                    append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
                     for device in devices {
                         update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
                     }
                     raw("BUILD FAILED: \(error.localizedDescription)")
                     continue
                 }
-                append(.success, "Built \(product.appURL.lastPathComponent)")
+                append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
 
                 for device in devices {
                     try Task.checkCancellation()
                     status = .deploying(device.name)
                     update { $0.deviceOutcomes[device.id] = .running }
                     append(.step, "Deploying to \(device.name)")
+                    let deployStart = Date()
+                    defer {
+                        timings.deploy += Date().timeIntervalSince(deployStart)
+                        update { $0.timings = timings }
+                    }
                     do {
                         try await Deployer.deploy(product, to: device, log: raw)
                         update { $0.deviceOutcomes[device.id] = .succeeded }
-                        append(.success, "Launched on \(device.name)")
+                        append(.success, "Launched on \(device.name) in \(Date().timeIntervalSince(deployStart).formattedDuration)")
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch let error as DeployError {
                         update { $0.deviceOutcomes[device.id] = .warning(error.localizedDescription) }
-                        append(.warning, "\(device.name): \(error.localizedDescription)")
+                        append(.warning, "\(device.name): \(error.localizedDescription) (\(Date().timeIntervalSince(deployStart).formattedDuration))")
                     } catch {
                         let message = (error as? ShellError).map { lastMeaningfulLine($0.output) }
                             ?? error.localizedDescription
                         update { $0.deviceOutcomes[device.id] = .failed(message) }
-                        append(.error, "\(device.name): \(message)")
+                        append(.error, "\(device.name): \(message) (\(Date().timeIntervalSince(deployStart).formattedDuration))")
                     }
                 }
             }
@@ -219,29 +256,30 @@ final class PipelineRunner: Identifiable {
             let outcome = runs.first(where: { $0.id == record.id })?.finalOutcome(devices: config.devices)
                 ?? .succeeded
             update { $0.outcome = outcome }
+            let took = timings.summary(total: Date().timeIntervalSince(runStart))
             switch outcome {
             case .failed(let summary):
-                append(.error, summary)
+                append(.error, "\(summary) after \(took)")
                 Notifier.post(title: "\(config.name) failed", body: "\(commit.shortSHA): \(summary)")
             case .warning(let summary):
                 // The build is on every device, so it counts as deployed.
                 self.config.lastDeployedCommit = commit
                 self.config.lastDeployedAt = Date()
-                append(.warning, summary)
+                append(.warning, "\(summary) after \(took)")
                 Notifier.post(title: "Installed \(config.name)", body: "\(commit.shortSHA): \(summary)")
             default:
                 self.config.lastDeployedCommit = commit
                 self.config.lastDeployedAt = Date()
-                append(.success, "Deployed \(commit.shortSHA) to \(config.devices.count) device(s)")
+                append(.success, "Deployed \(commit.shortSHA) to \(config.devices.count) device(s) in \(took)")
                 Notifier.post(title: "Deployed \(config.name)",
                               body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
             }
         } catch is CancellationError {
             update { $0.outcome = .failed("Cancelled") }
-            append(.warning, "Cancelled")
+            append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
         } catch {
             update { $0.outcome = .failed(error.localizedDescription) }
-            append(.error, error.localizedDescription)
+            append(.error, "\(error.localizedDescription) (after \(Date().timeIntervalSince(runStart).formattedDuration))")
             Notifier.post(title: "\(config.name) failed", body: error.localizedDescription)
         }
         update { $0.finishedAt = Date() }
@@ -259,9 +297,11 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Logging
 
-    private func append(_ level: LogLine.Level, _ text: String) {
-        log.append(LogLine(level: level, text: text))
-        if log.count > 2000 { log.removeFirst(log.count - 2000) }
+    private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false) {
+        let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil)
+        log.append(line)
+        if log.count > Self.maxLogLines { log.removeFirst(log.count - Self.maxLogLines) }
+        history?.appendLog(line)
     }
 
     /// Writes every line to the run's log file; the UI only gets lines worth reading.
@@ -341,6 +381,82 @@ final class LogFile: @unchecked Sendable {
     func close() {
         lock.lock(); defer { lock.unlock() }
         try? handle?.close()
+    }
+}
+
+/// A pipeline's deploys and window log, kept on disk so they survive relaunches.
+/// The log is JSON lines, appended as lines come in; once the file holds twice `logLimit` lines
+/// it's cut back to the newest `logLimit`. Deploys are one JSON file, rewritten on every change.
+@MainActor
+final class PipelineHistory {
+    let directory: URL
+    let logLimit: Int
+    private var logURL: URL { directory.appendingPathComponent("activity.jsonl") }
+    private var runsURL: URL { directory.appendingPathComponent("runs.json") }
+    private var handle: FileHandle?
+    private var lineCount = 0
+
+    init(directory: URL, logLimit: Int = PipelineRunner.maxLogLines) {
+        self.directory = directory
+        self.logLimit = logLimit
+    }
+
+    convenience init(pipeline id: UUID) {
+        self.init(directory: Paths.logs.appendingPathComponent(id.uuidString, isDirectory: true))
+    }
+
+    /// Saved deploys; ones that were still going when Orchard quit are marked interrupted.
+    func loadRuns() -> [RunRecord] {
+        guard let data = try? Data(contentsOf: runsURL),
+              let runs = try? JSONDecoder().decode([RunRecord].self, from: data)
+        else { return [] }
+        return runs.map { $0.interruptedIfUnfinished() }
+    }
+
+    func saveRuns(_ runs: [RunRecord]) {
+        guard let data = try? JSONEncoder().encode(runs) else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: runsURL, options: .atomic)
+    }
+
+    /// The newest `logLimit` lines; rewrites the file without the older ones.
+    func loadLog() -> [LogLine] {
+        guard let data = try? Data(contentsOf: logURL) else { return [] }
+        let decoder = JSONDecoder()
+        let lines = data.split(separator: UInt8(ascii: "\n")).compactMap {
+            try? decoder.decode(LogLine.self, from: Data($0))
+        }
+        let kept = Array(lines.suffix(logLimit))
+        if kept.count < lines.count { replaceLog(with: kept) } else { lineCount = kept.count }
+        return kept
+    }
+
+    func appendLog(_ line: LogLine) {
+        if handle == nil {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            handle = try? FileHandle(forWritingTo: logURL)
+            _ = try? handle?.seekToEnd()
+        }
+        guard let data = try? JSONEncoder().encode(line) else { return }
+        try? handle?.write(contentsOf: data + Data("\n".utf8))
+        lineCount += 1
+        if lineCount >= 2 * logLimit { _ = loadLog() }
+    }
+
+    func replaceLog(with lines: [LogLine]) {
+        try? handle?.close()
+        handle = nil
+        let encoder = JSONEncoder()
+        var data = Data()
+        for line in lines {
+            guard let encoded = try? encoder.encode(line) else { continue }
+            data.append(encoded + Data("\n".utf8))
+        }
+        try? data.write(to: logURL, options: .atomic)
+        lineCount = lines.count
     }
 }
 

@@ -122,6 +122,10 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     var devices: [Device] = []
     var pollInterval: TimeInterval = 60
     var isEnabled = false
+    /// How many builds the deploy list and log keep; nil means the default.
+    /// Optional so older saved configs decode.
+    var historyLimit: Int?
+    var keptRuns: Int { max(1, historyLimit ?? 20) }
 
     /// Last commit installed on every device (launching it may have failed, e.g. on a locked phone).
     var lastDeployedCommit: String?
@@ -140,7 +144,7 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
-enum DeployOutcome: Equatable, Sendable {
+enum DeployOutcome: Equatable, Sendable, Codable {
     case pending
     case running
     case succeeded
@@ -149,15 +153,15 @@ enum DeployOutcome: Equatable, Sendable {
     case failed(String)
 }
 
-struct CommitSummary: Identifiable, Hashable, Sendable {
+struct CommitSummary: Identifiable, Hashable, Sendable, Codable {
     var sha: String
     var author: String
     var subject: String
     var id: String { sha }
 }
 
-struct RunRecord: Identifiable, Sendable {
-    let id = UUID()
+struct RunRecord: Identifiable, Sendable, Codable {
+    var id = UUID()
     var commit: String
     var subject: String?
     /// Commit deployed before this run, which `changes` are counted from.
@@ -169,6 +173,18 @@ struct RunRecord: Identifiable, Sendable {
     var outcome: DeployOutcome = .running
     var deviceOutcomes: [String: DeployOutcome] = [:]
     var logFile: URL?
+    var timings: RunTimings?
+
+    /// A run saved while still going, which Orchard quit in the middle of.
+    func interruptedIfUnfinished() -> RunRecord {
+        guard outcome == .running else { return self }
+        var run = self
+        run.outcome = .failed("Interrupted")
+        run.deviceOutcomes = deviceOutcomes.mapValues {
+            $0 == .running || $0 == .pending ? .failed("Interrupted") : $0
+        }
+        return run
+    }
 
     /// The run's outcome once every device is done: failed if any device failed, otherwise a
     /// warning naming the devices the app was installed on but not launched.
@@ -186,12 +202,55 @@ struct RunRecord: Identifiable, Sendable {
     }
 }
 
-struct LogLine: Identifiable, Sendable {
-    enum Level: Sendable { case info, step, warning, error, success }
+struct LogLine: Identifiable, Sendable, Codable {
+    enum Level: String, Sendable, Codable { case info, step, warning, error, success }
     let id = UUID()
-    let date = Date()
+    var date = Date()
     let level: Level
     let text: String
+    /// Marks the first line of a build, so the log can keep a number of builds.
+    var startsRun: Bool?
+
+    private enum CodingKeys: String, CodingKey { case date, level, text, startsRun }
+}
+
+extension [LogLine] {
+    /// The lines from the start of the last `count` runs on.
+    func keepingRuns(_ count: Int) -> [LogLine] {
+        let starts = indices.filter { self[$0].startsRun == true }
+        guard starts.count > count else { return self }
+        return count == 0 ? [] : Array(self[starts[starts.count - count]...])
+    }
+}
+
+/// How long each phase of a run took, for the log.
+struct RunTimings: Equatable, Sendable, Codable {
+    var checkout: TimeInterval = 0
+    var build: TimeInterval = 0
+    var deploy: TimeInterval = 0
+
+    /// "checkout 3s", "build 4m 10s", … for the phases that ran.
+    var phases: [String] {
+        [("checkout", checkout), ("build", build), ("deploy", deploy)]
+            .filter { $0.1 > 0 }
+            .map { "\($0.0) \($0.1.formattedDuration)" }
+    }
+
+    /// "4m 52s (checkout 3s, build 4m 10s, deploy 39s)".
+    func summary(total: TimeInterval) -> String {
+        phases.isEmpty ? total.formattedDuration
+            : "\(total.formattedDuration) (\(phases.joined(separator: ", ")))"
+    }
+}
+
+extension TimeInterval {
+    /// "12s", "4m 10s" or "1h 5m".
+    var formattedDuration: String {
+        let seconds = Int(rounded())
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+    }
 }
 
 extension String {

@@ -59,9 +59,18 @@ private struct RunRow: View {
                     .lineLimit(1)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text(run.startedAt, style: .time)
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
+                // Deploys are kept across launches, so older ones need their date.
+                let started = Text(run.startedAt, format: Calendar.current.isDateInToday(run.startedAt)
+                    ? .dateTime.hour().minute() : .dateTime.day().month().hour().minute())
+                Group {
+                    if let finishedAt = run.finishedAt {
+                        started + Text(" · \(finishedAt.timeIntervalSince(run.startedAt).formattedDuration)")
+                    } else {
+                        started
+                    }
+                }
+                .foregroundStyle(.secondary)
+                .font(.caption)
                 if let logFile = run.logFile {
                     Button("Log", systemImage: "doc.text") { NSWorkspace.shared.open(logFile) }
                         .labelStyle(.iconOnly)
@@ -78,6 +87,13 @@ private struct RunRow: View {
                         OutcomeIcon(outcome: outcome).imageScale(.small)
                     }
                     .help(outcome.message ?? device.name)
+                }
+                if let phases = run.timings?.phases, !phases.isEmpty {
+                    Spacer()
+                    Text(phases.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
             if let changes = run.changes, !changes.isEmpty, let base = run.baseCommit {
@@ -188,6 +204,9 @@ private struct LogView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onAppear {
+                    if let id = runner.log.last?.id { proxy.scrollTo(id, anchor: .bottom) }
                 }
                 .onChange(of: runner.log.last?.id) { _, id in
                     if let id { proxy.scrollTo(id, anchor: .bottom) }
