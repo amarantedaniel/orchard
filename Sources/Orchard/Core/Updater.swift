@@ -116,7 +116,6 @@ final class Updater {
     }
 
     nonisolated static let latestReleaseURL = URL(string: "https://api.github.com/repos/ambiapps/orchard/releases/latest")!
-    nonisolated static let checkInterval: Duration = .seconds(24 * 60 * 60)
 
     private(set) var state: State = .idle
     /// The newer release found by the last check, if any.
@@ -128,7 +127,7 @@ final class Updater {
     /// The release an install was started for, so the next launch can tell whether it took.
     @ObservationIgnored private let pendingKey = "pendingUpdateTag"
     @ObservationIgnored private var isPrompting = false
-    @ObservationIgnored private var loop: Task<Void, Never>?
+    @ObservationIgnored private var started = false
     /// Whether a pipeline is building or deploying, so the alert can warn that updating stops it.
     @ObservationIgnored var isBusy: () -> Bool = { false }
 
@@ -137,17 +136,15 @@ final class Updater {
         self.defaults = defaults
     }
 
-    /// Checks shortly after launch and then once a day. Does nothing when not running as a
-    /// bundled .app, because there's no version to compare against.
+    /// Checks once, shortly after launch; after that only "Check for Updates…" does. Does
+    /// nothing when not running as a bundled .app, because there's no version to compare against.
     func start() {
-        guard current != nil, loop == nil else { return }
+        guard current != nil, !started else { return }
+        started = true
         reportFailedInstall()
-        loop = Task { [weak self] in
+        Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
-            while !Task.isCancelled {
-                await self?.check(userInitiated: false)
-                try? await Task.sleep(for: Updater.checkInterval)
-            }
+            await self?.check(userInitiated: false)
         }
     }
 
