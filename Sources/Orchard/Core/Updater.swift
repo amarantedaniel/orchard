@@ -348,14 +348,17 @@ final class Updater {
         try await Shell.run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly",
                                                  "-noautoopen", "-mountpoint", mount.path])
         let staged = work.appendingPathComponent("Orchard.app")
-        let copied = await Result {
+        var copyError: Error?
+        do {
             try await Shell.run("/usr/bin/ditto", [mount.appendingPathComponent("Orchard.app").path, staged.path])
+        } catch {
+            copyError = error
         }
         // Detach before anything can delete `work`, or the image stays mounted inside it.
         if (try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path])) == nil {
             try await Shell.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"])
         }
-        _ = try copied.get()
+        if let copyError { throw copyError }
 
         try validate(staged, expecting: version)
         try await Shell.run("/usr/bin/codesign", ["--verify", "--deep", staged.path])
