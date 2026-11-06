@@ -10,12 +10,16 @@ final class WindowHarness {
 
     init(_ view: some View, size: NSSize, appearance: NSAppearance.Name? = nil) {
         _ = NSApplication.shared
-        window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        window = OffscreenWindow(contentViewController: NSHostingController(rootView: view))
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window.isReleasedWhenClosed = false
         window.appearance = appearance.flatMap(NSAppearance.init(named:))
         window.setContentSize(size)
-        window.orderFrontRegardless()
+        window.setFrameOrigin(OffscreenWindow.origin)
+        // Ordered in (layout needs it) but off screen and behind everything, so test runs
+        // don't cover the developer's windows.
+        window.orderBack(nil)
+        assert(!NSScreen.screens.contains { $0.frame.intersects(window.frame) })
         settle()
     }
 
@@ -42,6 +46,19 @@ final class WindowHarness {
     }
 
     func close() { window.close() }
+}
+
+/// A window AppKit doesn't pull back onto a screen, so tests can lay it out out of sight.
+final class OffscreenWindow: NSWindow {
+    static let origin = NSPoint(x: -20_000, y: -20_000)
+    /// Keeps the window where it was put, but still caps its size at the screen's as AppKit does
+    /// for on-screen windows, so layouts match what an on-screen window would get.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        guard let visible = (screen ?? NSScreen.main)?.visibleFrame else { return frameRect }
+        return NSRect(origin: frameRect.origin,
+                      size: NSSize(width: min(frameRect.width, visible.width),
+                                   height: min(frameRect.height, visible.height)))
+    }
 }
 
 /// An in-memory `AppStore` without device discovery: tests never see or change the user's
