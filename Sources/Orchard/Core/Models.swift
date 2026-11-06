@@ -221,6 +221,15 @@ extension [LogLine] {
         guard starts.count > count else { return self }
         return count == 0 ? [] : Array(self[starts[starts.count - count]...])
     }
+
+    /// At most the newest `limit` lines, starting at a run when one starts among them, so a
+    /// cut never leaves half a build at the top.
+    func keepingLines(_ limit: Int) -> [LogLine] {
+        guard count > limit else { return self }
+        let kept = suffix(limit)
+        guard let start = kept.firstIndex(where: { $0.startsRun == true }) else { return Array(kept) }
+        return Array(self[start...])
+    }
 }
 
 /// How long each phase of a run took, for the log.

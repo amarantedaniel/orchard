@@ -288,6 +288,7 @@ final class PipelineRunner: Identifiable {
 
     /// Removes Orchard's checkout and build products for this pipeline.
     func cleanUp() async {
+        history?.close()
         loopTask?.cancel()
         runTask?.cancel()
         let dirs = Paths.pipeline(config.id)
@@ -300,7 +301,7 @@ final class PipelineRunner: Identifiable {
     private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false) {
         let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil)
         log.append(line)
-        if log.count > Self.maxLogLines { log.removeFirst(log.count - Self.maxLogLines) }
+        if log.count > Self.maxLogLines { log = log.keepingLines(Self.maxLogLines) }
         history?.appendLog(line)
     }
 
@@ -386,19 +387,21 @@ final class LogFile: @unchecked Sendable {
 
 /// A pipeline's deploys and window log, kept on disk so they survive relaunches.
 /// The log is JSON lines, appended as lines come in; once the file holds twice `logLimit` lines
-/// it's cut back to the newest `logLimit`. Deploys are one JSON file, rewritten on every change.
+/// it's cut back to at most `logLimit`, by whole runs. Deploys are one JSON file, rewritten on
+/// every change. Encoding happens on the main actor, file I/O on one background queue shared by
+/// every pipeline, so a new instance reads only after an old one's writes have landed.
 @MainActor
 final class PipelineHistory {
     let directory: URL
     let logLimit: Int
-    private var logURL: URL { directory.appendingPathComponent("activity.jsonl") }
-    private var runsURL: URL { directory.appendingPathComponent("runs.json") }
-    private var handle: FileHandle?
+    private static let io = DispatchQueue(label: "se.ambi.Orchard.PipelineHistory")
+    private let files: HistoryFiles
     private var lineCount = 0
 
     init(directory: URL, logLimit: Int = PipelineRunner.maxLogLines) {
         self.directory = directory
         self.logLimit = logLimit
+        self.files = HistoryFiles(directory: directory)
     }
 
     convenience init(pipeline id: UUID) {
@@ -406,32 +409,110 @@ final class PipelineHistory {
     }
 
     /// Saved deploys; ones that were still going when Orchard quit are marked interrupted.
+    /// A file that doesn't decode (say, from a newer Orchard) is moved aside, not overwritten.
     func loadRuns() -> [RunRecord] {
-        guard let data = try? Data(contentsOf: runsURL),
-              let runs = try? JSONDecoder().decode([RunRecord].self, from: data)
-        else { return [] }
+        guard let data = Self.io.sync(execute: { files.readRuns() }) else { return [] }
+        guard let runs = try? JSONDecoder().decode([RunRecord].self, from: data) else {
+            Self.io.sync { files.setAsideRuns() }
+            return []
+        }
         return runs.map { $0.interruptedIfUnfinished() }
     }
 
     func saveRuns(_ runs: [RunRecord]) {
         guard let data = try? JSONEncoder().encode(runs) else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try? data.write(to: runsURL, options: .atomic)
+        let files = files
+        Self.io.async { files.writeRuns(data) }
     }
 
-    /// The newest `logLimit` lines; rewrites the file without the older ones.
+    /// The newest lines, at most `logLimit` and starting at a run; rewrites the file without the
+    /// older ones.
     func loadLog() -> [LogLine] {
-        guard let data = try? Data(contentsOf: logURL) else { return [] }
-        let decoder = JSONDecoder()
-        let lines = data.split(separator: UInt8(ascii: "\n")).compactMap {
-            try? decoder.decode(LogLine.self, from: Data($0))
-        }
-        let kept = Array(lines.suffix(logLimit))
+        guard let data = Self.io.sync(execute: { files.readLog() }) else { return [] }
+        let lines = Self.decode(data)
+        let kept = lines.keepingLines(logLimit)
         if kept.count < lines.count { replaceLog(with: kept) } else { lineCount = kept.count }
         return kept
     }
 
     func appendLog(_ line: LogLine) {
+        guard let data = try? JSONEncoder().encode(line) else { return }
+        let files = files
+        Self.io.async { files.appendLog(data + Data("\n".utf8)) }
+        lineCount += 1
+        if lineCount >= 2 * logLimit {
+            let limit = logLimit
+            Self.io.async {
+                guard let data = files.readLog() else { return }
+                files.writeLog(Self.encode(Self.decode(data).keepingLines(limit)))
+            }
+            lineCount = logLimit
+        }
+    }
+
+    func replaceLog(with lines: [LogLine]) {
+        let data = Self.encode(lines)
+        let files = files
+        Self.io.async { files.writeLog(data) }
+        lineCount = lines.count
+    }
+
+    /// Closes the log file, for a pipeline that's being removed.
+    func close() {
+        let files = files
+        Self.io.async { files.closeLog() }
+    }
+
+    /// Waits for pending writes, so tests can read the files.
+    func flush() { Self.io.sync {} }
+
+    private nonisolated static func decode(_ data: Data) -> [LogLine] {
+        let decoder = JSONDecoder()
+        return data.split(separator: UInt8(ascii: "\n")).compactMap {
+            try? decoder.decode(LogLine.self, from: Data($0))
+        }
+    }
+
+    private nonisolated static func encode(_ lines: [LogLine]) -> Data {
+        let encoder = JSONEncoder()
+        var data = Data()
+        for line in lines {
+            guard let encoded = try? encoder.encode(line) else { continue }
+            data.append(encoded + Data("\n".utf8))
+        }
+        return data
+    }
+}
+
+/// `PipelineHistory`'s files. Only touched on `PipelineHistory.io`, which serializes access.
+private final class HistoryFiles: @unchecked Sendable {
+    let directory: URL
+    private var logURL: URL { directory.appendingPathComponent("activity.jsonl") }
+    private var runsURL: URL { directory.appendingPathComponent("runs.json") }
+    private var handle: FileHandle?
+
+    init(directory: URL) { self.directory = directory }
+
+    func readRuns() -> Data? { try? Data(contentsOf: runsURL) }
+
+    func writeRuns(_ data: Data) {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: runsURL, options: .atomic)
+    }
+
+    /// Keeps an unreadable `runs.json` as `runs-unreadable.json`, replacing an older one.
+    func setAsideRuns() {
+        let aside = directory.appendingPathComponent("runs-unreadable.json")
+        try? FileManager.default.removeItem(at: aside)
+        try? FileManager.default.moveItem(at: runsURL, to: aside)
+    }
+
+    func readLog() -> Data? {
+        try? handle?.synchronize()
+        return try? Data(contentsOf: logURL)
+    }
+
+    func appendLog(_ data: Data) {
         if handle == nil {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             if !FileManager.default.fileExists(atPath: logURL.path) {
@@ -440,23 +521,18 @@ final class PipelineHistory {
             handle = try? FileHandle(forWritingTo: logURL)
             _ = try? handle?.seekToEnd()
         }
-        guard let data = try? JSONEncoder().encode(line) else { return }
-        try? handle?.write(contentsOf: data + Data("\n".utf8))
-        lineCount += 1
-        if lineCount >= 2 * logLimit { _ = loadLog() }
+        try? handle?.write(contentsOf: data)
     }
 
-    func replaceLog(with lines: [LogLine]) {
+    func writeLog(_ data: Data) {
+        closeLog()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: logURL, options: .atomic)
+    }
+
+    func closeLog() {
         try? handle?.close()
         handle = nil
-        let encoder = JSONEncoder()
-        var data = Data()
-        for line in lines {
-            guard let encoded = try? encoder.encode(line) else { continue }
-            data.append(encoded + Data("\n".utf8))
-        }
-        try? data.write(to: logURL, options: .atomic)
-        lineCount = lines.count
     }
 }
 

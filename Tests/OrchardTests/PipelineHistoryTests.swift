@@ -49,13 +49,17 @@ struct PipelineHistoryTests {
             == ["phone": .succeeded, "pad": .failed("Interrupted"), "mac": .failed("Interrupted")])
     }
 
-    @Test func launchingDoesNotOverwriteDeploysItCannotRead() throws {
+    @Test func keepsDeploysItCannotRead() throws {
         let dir = try TemporaryDirectory()
-        try dir.write("runs.json", #"[{"from":"a future version"}]"#)
+        let unreadable = #"[{"from":"a future version"}]"#
+        try dir.write("runs.json", unreadable)
         let runner = PipelineRunner(config: PipelineConfig(), history: PipelineHistory(directory: dir.url))
         #expect(runner.runs.isEmpty)
-        #expect(try String(contentsOf: dir.url.appendingPathComponent("runs.json"), encoding: .utf8)
-            == #"[{"from":"a future version"}]"#)
+        // The next deploy saves a new list, but the unreadable one is kept aside.
+        runner.runs = [RunRecord(commit: String(repeating: "a", count: 40))]
+        #expect(PipelineRunner(config: PipelineConfig(), history: PipelineHistory(directory: dir.url)).runs.count == 1)
+        #expect(try String(contentsOf: dir.url.appendingPathComponent("runs-unreadable.json"), encoding: .utf8)
+            == unreadable)
     }
 
     @Test func loweringTheLimitTrimsRightAway() throws {
@@ -72,11 +76,26 @@ struct PipelineHistoryTests {
         let history = PipelineHistory(directory: dir.url, logLimit: 3)
         for i in 1...7 { history.appendLog(LogLine(level: .info, text: "\(i)")) }
 
-        #expect(PipelineHistory(directory: dir.url, logLimit: 3).loadLog().map(\.text) == ["5", "6", "7"])
+        let reloaded = PipelineHistory(directory: dir.url, logLimit: 3)
+        #expect(reloaded.loadLog().map(\.text) == ["5", "6", "7"])
+        reloaded.flush()
         // Loading trimmed the file itself, not just what it returned.
         let fileLines = try String(contentsOf: dir.url.appendingPathComponent("activity.jsonl"), encoding: .utf8)
             .split(separator: "\n")
         #expect(fileLines.count == 3)
+    }
+
+    @Test func trimsTheLogFileByWholeRuns() throws {
+        let dir = try TemporaryDirectory()
+        let history = PipelineHistory(directory: dir.url, logLimit: 4)
+        for run in 1...3 {
+            history.appendLog(LogLine(level: .step, text: "run \(run)", startsRun: true))
+            history.appendLog(LogLine(level: .info, text: "built \(run)"))
+            history.appendLog(LogLine(level: .info, text: "deployed \(run)"))
+        }
+        // The newest 4 lines start mid-run 2, so only run 3 is kept.
+        #expect(PipelineHistory(directory: dir.url, logLimit: 4).loadLog().map(\.text)
+            == ["run 3", "built 3", "deployed 3"])
     }
 
     @Test func formatsDurations() {
@@ -102,6 +121,14 @@ struct HistoryLimitTests {
         #expect(log.keepingRuns(2).map(\.text) == log.map(\.text))
         #expect(log.keepingRuns(5).map(\.text) == log.map(\.text))
         #expect(log.keepingRuns(0).isEmpty)
+    }
+
+    @Test func capsLinesAtARunBoundary() {
+        let log = [line("run 1", startsRun: true), line("built 1"), line("run 2", startsRun: true), line("built 2")]
+        #expect(log.keepingLines(4).map(\.text) == log.map(\.text))
+        #expect(log.keepingLines(3).map(\.text) == ["run 2", "built 2"])
+        // One run longer than the cap is cut as before.
+        #expect(log.keepingLines(1).map(\.text) == ["built 2"])
     }
 
     @Test func defaultsToTwentyBuildsForOlderConfigs() throws {
