@@ -1,0 +1,381 @@
+import AppKit
+import Foundation
+import Observation
+
+/// A release version: the marketing version from `VERSION` plus CI's build number, as in the
+/// release tag `v1.0.6(7)` or the bundle's `CFBundleShortVersionString`/`CFBundleVersion`.
+struct AppVersion: Comparable, CustomStringConvertible, Sendable {
+    let components: [Int]
+    let build: Int
+
+    init(components: [Int], build: Int) {
+        self.components = components
+        self.build = build
+    }
+
+    /// Parses `v1.0.6(7)`, `1.0.6(7)` or `1.0.6` (build 0).
+    init?(tag: String) {
+        var text = Substring(tag.trimmingCharacters(in: .whitespaces))
+        if text.first == "v" || text.first == "V" { text = text.dropFirst() }
+        var build = 0
+        if let open = text.firstIndex(of: "("), text.last == ")" {
+            guard let number = Int(text[text.index(after: open)..<text.index(before: text.endIndex)]) else { return nil }
+            build = number
+            text = text[..<open]
+        }
+        self.init(marketing: String(text), build: build)
+    }
+
+    init?(marketing: String, build: Int) {
+        let parts = marketing.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil && $0! >= 0 }) else { return nil }
+        self.init(components: parts.map { $0! }, build: build)
+    }
+
+    /// The running app's version, or nil when it isn't a bundled .app (`swift run`).
+    static func current(bundle: Bundle = .main) -> AppVersion? {
+        guard let marketing = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        else { return nil }
+        let build = (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String).flatMap(Int.init) ?? 0
+        return AppVersion(marketing: marketing, build: build)
+    }
+
+    var marketing: String { components.map(String.init).joined(separator: ".") }
+    var description: String { build > 0 ? "\(marketing) (\(build))" : marketing }
+
+    static func < (lhs: AppVersion, rhs: AppVersion) -> Bool {
+        let count = max(lhs.components.count, rhs.components.count)
+        for index in 0..<count {
+            let left = index < lhs.components.count ? lhs.components[index] : 0
+            let right = index < rhs.components.count ? rhs.components[index] : 0
+            if left != right { return left < right }
+        }
+        return lhs.build < rhs.build
+    }
+
+    static func == (lhs: AppVersion, rhs: AppVersion) -> Bool { !(lhs < rhs) && !(rhs < lhs) }
+}
+
+/// A GitHub release, as returned by `GET /repos/{owner}/{repo}/releases/latest`.
+struct Release: Decodable, Sendable {
+    struct Asset: Decodable, Sendable {
+        let name: String
+        let browserDownloadURL: URL
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
+        }
+    }
+
+    let tagName: String
+    let htmlURL: URL
+    let body: String?
+    let assets: [Asset]
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlURL = "html_url"
+        case body, assets
+    }
+
+    var version: AppVersion? { AppVersion(tag: tagName) }
+    var dmg: Asset? { assets.first { $0.name.hasSuffix(".dmg") } }
+
+    /// GitHub's generated notes as plain lines: no headings or "Full Changelog" footer, bullets
+    /// as "•" and PR links shortened to "(#12)".
+    var notes: String {
+        guard let body else { return "" }
+        return body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+            .filter { !$0.hasPrefix("**Full Changelog**") && !$0.hasPrefix("#") }
+            .map { line in
+                var line = line
+                if line.hasPrefix("* ") || line.hasPrefix("- ") { line = "• " + line.dropFirst(2) }
+                return line.replacingOccurrences(
+                    of: #" in https://github\.com/[^/]+/[^/]+/pull/(\d+)"#, with: " (#$1)",
+                    options: .regularExpression)
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Checks GitHub for a newer release, offers it in an alert and installs it in place.
+///
+/// Installing downloads the release DMG, copies the app out of it and hands the swap to a small
+/// shell script that waits for Orchard to quit, replaces the bundle and relaunches it.
+@MainActor
+@Observable
+final class Updater {
+    enum State: Equatable {
+        case idle
+        case checking
+        case installing
+    }
+
+    nonisolated static let latestReleaseURL = URL(string: "https://api.github.com/repos/ambiapps/orchard/releases/latest")!
+    nonisolated static let checkInterval: Duration = .seconds(24 * 60 * 60)
+
+    private(set) var state: State = .idle
+    /// The newer release found by the last check, if any.
+    private(set) var available: Release?
+
+    @ObservationIgnored let current: AppVersion?
+    @ObservationIgnored private let defaults: UserDefaults?
+    @ObservationIgnored private let skippedKey = "skippedUpdateTag"
+    @ObservationIgnored private var loop: Task<Void, Never>?
+    /// Whether a pipeline is building or deploying, so the alert can warn that updating stops it.
+    @ObservationIgnored var isBusy: () -> Bool = { false }
+
+    init(current: AppVersion? = .current(), defaults: UserDefaults? = .standard) {
+        self.current = current
+        self.defaults = defaults
+    }
+
+    /// Checks shortly after launch and then once a day. Does nothing when not running as a
+    /// bundled .app, because there's no version to compare against.
+    func start() {
+        guard current != nil, loop == nil else { return }
+        loop = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            while !Task.isCancelled {
+                await self?.check(userInitiated: false)
+                try? await Task.sleep(for: Updater.checkInterval)
+            }
+        }
+    }
+
+    /// Looks for a newer release. Background checks only speak up about a version the user
+    /// hasn't skipped; a check from the menu always reports its result.
+    func check(userInitiated: Bool) async {
+        guard state == .idle else { return }
+        state = .checking
+        let result: Result<Release, Error>
+        do {
+            result = .success(try await Self.fetchLatest())
+        } catch {
+            result = .failure(error)
+        }
+        state = .idle
+
+        switch result {
+        case .failure(let error):
+            if userInitiated { showError("Couldn't check for updates", error) }
+        case .success(let release):
+            guard let version = release.version, Self.isNewer(version, than: current) else {
+                available = nil
+                if userInitiated { showUpToDate() }
+                return
+            }
+            available = release
+            if userInitiated || defaults?.string(forKey: skippedKey) != release.tagName {
+                prompt(release)
+            }
+        }
+    }
+
+    /// Whether `version` should be offered over `current`. Without a current version (`swift run`)
+    /// any release counts, so a manual check can still point at the download.
+    nonisolated static func isNewer(_ version: AppVersion, than current: AppVersion?) -> Bool {
+        guard let current else { return true }
+        return version > current
+    }
+
+    nonisolated static func fetchLatest() async throws -> Release {
+        var request = URLRequest(url: latestReleaseURL)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Orchard", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw UpdateError("GitHub answered with HTTP \(http.statusCode).")
+        }
+        return try JSONDecoder().decode(Release.self, from: data)
+    }
+
+    // MARK: - Alert
+
+    /// Shows the update alert for whatever was found last, e.g. from the menu bar item.
+    func promptAvailable() {
+        if let available { prompt(available) }
+    }
+
+    private func prompt(_ release: Release) {
+        let canInstall = Self.installLocation() != nil && release.dmg != nil
+        let alert = Self.makeAlert(for: release, current: current, canInstall: canInstall, busy: isBusy())
+        NSApp.activate()
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            if canInstall {
+                Task { await install(release) }
+            } else {
+                NSWorkspace.shared.open(release.htmlURL)
+            }
+        case .alertThirdButtonReturn:
+            defaults?.set(release.tagName, forKey: skippedKey)
+        default:
+            break
+        }
+    }
+
+    /// The "Update Available" alert. Built separately so tests can render it.
+    static func makeAlert(for release: Release, current: AppVersion?, canInstall: Bool, busy: Bool) -> NSAlert {
+        let alert = NSAlert()
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Update Available"
+        let new = release.version?.description ?? release.tagName
+        var info = "Orchard \(new) is available"
+        info += current.map { " — you have \($0)." } ?? "."
+        if canInstall && busy {
+            info += " Updating stops the build or deploy that's running now."
+        } else if !canInstall {
+            info += " Orchard can't replace itself here, so download it from GitHub."
+        }
+        alert.informativeText = info
+        alert.addButton(withTitle: canInstall ? "Install and Relaunch" : "Download…")
+        alert.addButton(withTitle: "Later")
+        alert.addButton(withTitle: "Skip This Version")
+
+        let notes = release.notes
+        if !notes.isEmpty {
+            let scroll = NSTextView.scrollableTextView()
+            scroll.frame = NSRect(x: 0, y: 0, width: 380, height: 140)
+            scroll.borderType = .lineBorder
+            let text = scroll.documentView as! NSTextView
+            text.isEditable = false
+            text.drawsBackground = false
+            text.textContainerInset = NSSize(width: 4, height: 6)
+            let options = AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            let attributed = (try? AttributedString(markdown: notes, options: options)) ?? AttributedString(notes)
+            let styled = NSMutableAttributedString(attributed)
+            styled.addAttributes([.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                                  .foregroundColor: NSColor.labelColor],
+                                 range: NSRange(location: 0, length: styled.length))
+            text.textStorage?.setAttributedString(styled)
+            alert.accessoryView = scroll
+        }
+        return alert
+    }
+
+    private func showUpToDate() {
+        let alert = NSAlert()
+        alert.messageText = "You're up to date"
+        alert.informativeText = "Orchard \(current?.description ?? "") is the newest version."
+        NSApp.activate()
+        alert.runModal()
+    }
+
+    private func showError(_ title: String, _ error: Error) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        NSApp.activate()
+        alert.runModal()
+    }
+
+    // MARK: - Install
+
+    /// The running .app, when Orchard can replace it: a bundled app whose folder is writable.
+    static func installLocation(bundle: Bundle = .main) -> URL? {
+        let app = bundle.bundleURL
+        guard app.pathExtension == "app",
+              FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path)
+        else { return nil }
+        return app
+    }
+
+    private func install(_ release: Release) async {
+        guard state == .idle, let destination = Self.installLocation(), let dmg = release.dmg else { return }
+        state = .installing
+        do {
+            let staged = try await Self.download(dmg.browserDownloadURL, expecting: release.version)
+            try Self.relaunch(replacing: destination, with: staged)
+            NSApp.terminate(nil)
+        } catch {
+            state = .idle
+            showError("Couldn't install the update", error)
+        }
+    }
+
+    /// Downloads the DMG and copies the app out of it into a temporary folder, after checking
+    /// it's an intact Orchard of the expected version.
+    nonisolated static func download(_ url: URL, expecting version: AppVersion?) async throws -> URL {
+        let work = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OrchardUpdate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let dmg = work.appendingPathComponent("Orchard.dmg")
+        let (downloaded, response) = try await URLSession.shared.download(from: url)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw UpdateError("The download failed with HTTP \(http.statusCode).")
+        }
+        try FileManager.default.moveItem(at: downloaded, to: dmg)
+
+        let mount = work.appendingPathComponent("mount")
+        try await Shell.run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly",
+                                                 "-noautoopen", "-mountpoint", mount.path])
+        let staged = work.appendingPathComponent("Orchard.app")
+        do {
+            try await Shell.run("/usr/bin/ditto", [mount.appendingPathComponent("Orchard.app").path, staged.path])
+        } catch {
+            _ = try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"])
+            throw error
+        }
+        _ = try? await Shell.run("/usr/bin/hdiutil", ["detach", mount.path])
+
+        try validate(staged, expecting: version)
+        try await Shell.run("/usr/bin/codesign", ["--verify", "--deep", staged.path])
+        return staged
+    }
+
+    /// Checks that `app` is Orchard and, when known, the version the release promised.
+    nonisolated static func validate(_ app: URL, expecting version: AppVersion?) throws {
+        guard let bundle = Bundle(url: app),
+              bundle.bundleIdentifier == "se.ambi.Orchard"  // Set by scripts/build-app.sh.
+        else { throw UpdateError("The downloaded app isn't Orchard.") }
+        if let version, AppVersion.current(bundle: bundle) != version {
+            throw UpdateError("The downloaded app isn't version \(version).")
+        }
+    }
+
+    /// Starts a helper that waits for this process to exit, swaps `destination` for `staged`
+    /// (restoring the old app if the copy fails) and opens the result. Launched with `Process`
+    /// rather than `Shell` because it has to outlive Orchard.
+    static func relaunch(replacing destination: URL, with staged: URL, opener: String = "/usr/bin/open",
+                         waitingFor pid: Int32 = ProcessInfo.processInfo.processIdentifier) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", swapScript, "orchard-update",
+                             String(pid),
+                             destination.path, staged.path, opener]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+
+    /// `$1` pid to wait for, `$2` installed app, `$3` new app (inside the temporary work folder),
+    /// `$4` the command that opens it (tests pass `/usr/bin/true`).
+    nonisolated static let swapScript = #"""
+        while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+        work="$(dirname "$3")"
+        if mv "$2" "$work/Previous.app"; then
+            if ! /usr/bin/ditto "$3" "$2"; then
+                rm -rf "$2"
+                mv "$work/Previous.app" "$2"
+            fi
+        fi
+        /usr/bin/xattr -dr com.apple.quarantine "$2" 2>/dev/null
+        "$4" "$2"
+        rm -rf "$work"
+        """#
+}
+
+struct UpdateError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}

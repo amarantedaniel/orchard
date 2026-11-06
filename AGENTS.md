@@ -6,7 +6,7 @@ Guide for AI coding agents working on this repo. All of the code here is written
 
 A macOS menu bar + window app (SwiftUI, macOS 15+) for iOS/macOS developers. You point it at a local git clone, a branch, an Xcode scheme and a set of devices. While a pipeline is enabled, Orchard polls the branch and, whenever its head commit changes, builds the app and installs + launches it on every chosen device: this Mac, paired physical iPhones/iPads/Apple TVs/Apple Watches/Vision Pros, and booted simulators. It's like a tiny local CD server for your own devices.
 
-It shells out to the developer's own tools: `git`, `xcodebuild`, `xcrun devicectl` (physical devices) and `xcrun simctl` (simulators). There's no server and no network code of its own.
+It shells out to the developer's own tools: `git`, `xcodebuild`, `xcrun devicectl` (physical devices) and `xcrun simctl` (simulators). There's no server; its only network code is `Updater`, which asks the GitHub API for the latest release and downloads its DMG.
 
 ## Layout
 
@@ -24,6 +24,8 @@ Sources/Orchard/
     Deployer.swift            Install + launch on this Mac / physical device / simulator
     DeviceDiscovery.swift     Paired devices (devicectl JSON) and booted simulators (simctl JSON)
     Shell.swift               Async Process wrapper with login-shell PATH and line streaming. All commands go through it
+    Updater.swift             AppVersion (tag/bundle parsing, comparison), GitHub latest-release check, the
+                              "Update Available" NSAlert, and self-update (download DMG → stage app → swap script)
   Views/
     ContentView.swift         Three-column NavigationSplitView (pipelines | settings | activity), Layout widths
     PipelineDetailView.swift  Settings column (repo, branch, container, scheme, configuration, devices, interval)
@@ -62,11 +64,12 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
-- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. `makeTestStore()` gives an in-memory `AppStore` without device discovery; never build one on `.standard` in tests.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows; keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` without device discovery; never build one on `.standard` in tests.
 - `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list. The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
 - `GitTests` runs real `git` against temporary repos (a bare repo stands in as `origin`). Pass identity with `-c user.name=… -c user.email=…`, because CI has no global git config.
+- `ORCHARD_NETWORK_TESTS=1 swift test --filter Updater` downloads the latest real release and stages its app, to check the self-update download path end to end. CI doesn't run it.
 - Anything that needs Xcode signing, `devicectl` or real devices can't run in CI. Keep that logic thin, and pull parsing/decision code out into testable functions.
 - Add tests for new logic in `Core/`. Views get layout tests through `WindowHarness` when a bug is about layout; otherwise they aren't unit-tested.
 
@@ -78,6 +81,7 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 - **Concurrency:** Swift 6 language mode with strict concurrency. `AppStore` and `PipelineRunner` are `@MainActor @Observable`. Log callbacks are `@Sendable` and may be called off the main actor.
 - **Main window layout:** one three-column `NavigationSplitView`. Don't nest an `HSplitView` in a column: on macOS 26 the columns extend under the floating sidebar, so a nested horizontal split view's minimum width grows with the sidebar until the window overflows. A `VSplitView` (as in `ActivityView`) is fine. `Layout.windowMinWidth` must fit every column's minimum.
 - **App icon:** edit `Resources/AppIcon.icon` in Icon Composer (or its `icon.json`/SVGs directly). `build-app.sh` passes `actool` absolute paths, because it resolves relative ones in a helper process with a different cwd.
+- **Self-update** relies on the release tag format `v<VERSION>(<build>)`, a `.dmg` asset holding `Orchard.app`, and the bundle id `se.ambi.Orchard`. Changing any of these in `release.yml` or `build-app.sh` breaks updating for everyone already installed. The swap runs in a detached `/bin/sh` script (`Updater.swapScript`), not through `Shell`, because it has to outlive the app.
 - Keep `README.md` and the screenshots in `docs/` current when you change behavior or UI. The marketing site is a separate repo, [ambiapps/orchard-web](https://github.com/ambiapps/orchard-web). Update it when you add or change user-facing features.
 
 ## Fixing bugs
