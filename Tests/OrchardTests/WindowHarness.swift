@@ -51,7 +51,17 @@ final class WindowHarness {
 /// A window AppKit doesn't pull back onto a screen, so tests can lay it out out of sight.
 final class OffscreenWindow: NSWindow {
     static let origin = NSPoint(x: -20_000, y: -20_000)
-    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    /// Keeps the window where it was put, but still caps its size at the screen's as AppKit does
+    /// for on-screen windows, so layouts match what an on-screen window would get.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        guard let visible = (screen ?? NSScreen.main)?.visibleFrame else { return frameRect }
+        if ProcessInfo.processInfo.environment["CI"] != nil, frameRect.width > 1300 {
+            print("OffscreenWindow: screen \(visible), requested \(frameRect.size)")  // TEMP diagnostic
+        }
+        return NSRect(origin: frameRect.origin,
+                      size: NSSize(width: min(frameRect.width, visible.width),
+                                   height: min(frameRect.height, visible.height)))
+    }
 }
 
 /// An in-memory `AppStore` without device discovery: tests never see or change the user's
