@@ -59,6 +59,7 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private let history: PipelineHistory?
+    @ObservationIgnored private var isCheckingCrashes = false
 
     nonisolated var id: UUID { _id }
     @ObservationIgnored private nonisolated let _id: UUID
@@ -90,6 +91,7 @@ final class PipelineRunner: Identifiable {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.check(force: false)
+                await self.checkCrashes()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -179,6 +181,7 @@ final class PipelineRunner: Identifiable {
         let dirs = Paths.pipeline(config.id)
         let runStart = Date()
         var timings = RunTimings()
+        var installed: [DeployedApp] = []
 
         do {
             status = .preparing
@@ -224,6 +227,8 @@ final class PipelineRunner: Identifiable {
                     continue
                 }
                 append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
+                let app = DeployedApp(platform: platform, appPath: product.appURL.path,
+                                      executableName: product.executableName)
 
                 for device in devices {
                     try Task.checkCancellation()
@@ -237,11 +242,13 @@ final class PipelineRunner: Identifiable {
                     }
                     do {
                         try await Deployer.deploy(product, to: device, log: raw)
+                        if !installed.contains(app) { installed.append(app) }
                         update { $0.deviceOutcomes[device.id] = .succeeded }
                         append(.success, "Launched on \(device.name) in \(Date().timeIntervalSince(deployStart).formattedDuration)")
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch let error as DeployError {
+                        if !installed.contains(app) { installed.append(app) }
                         update { $0.deviceOutcomes[device.id] = .warning(error.localizedDescription) }
                         append(.warning, "\(device.name): \(error.localizedDescription) (\(Date().timeIntervalSince(deployStart).formattedDuration))")
                     } catch {
@@ -282,8 +289,52 @@ final class PipelineRunner: Identifiable {
             append(.error, "\(error.localizedDescription) (after \(Date().timeIntervalSince(runStart).formattedDuration))")
             Notifier.post(title: "\(config.name) failed", body: error.localizedDescription)
         }
+        if !installed.isEmpty {
+            let platforms = Set(installed.map(\.platform))
+            self.config.deployedApps = (self.config.deployedApps ?? []).filter { !platforms.contains($0.platform) }
+                + installed
+            // Crashes of this build count from the start of the run, so a crash right at launch
+            // is caught; earlier ones were checked by previous polls.
+            self.config.crashesCheckedUntil = max(self.config.crashesCheckedUntil ?? runStart, runStart)
+        }
         update { $0.finishedAt = Date() }
         logFile.close()
+    }
+
+    // MARK: Crashes
+
+    /// Logs crash reports of the deployed app that appeared on any device since the last check.
+    private func checkCrashes() async {
+        guard !isCheckingCrashes, let apps = config.deployedApps, !apps.isEmpty,
+              let since = config.crashesCheckedUntil else { return }
+        isCheckingCrashes = true
+        defer { isCheckingCrashes = false }
+
+        let folder = Paths.logs.appendingPathComponent("\(config.id.uuidString)/crashes", isDirectory: true)
+        var newest = since
+        for device in config.devices {
+            guard let app = apps.first(where: { $0.platform == device.platform }) else { continue }
+            let found = await CrashReports.newReports(
+                on: device, executable: app.executableName, since: since, into: folder)
+            for (report, file) in found {
+                let symbolicated = await CrashReports.symbolicate(report, app: URL(fileURLWithPath: app.appPath))
+                logCrash(symbolicated, on: device, file: file)
+                newest = max(newest, report.timestamp)
+            }
+        }
+        // Only advanced to the newest report: a report is written a few seconds after its crash,
+        // so advancing to "now" could skip one still being written.
+        if newest > since { config.crashesCheckedUntil = newest }
+    }
+
+    private func logCrash(_ report: CrashReport, on device: Device, file: URL) {
+        let time = report.timestamp.formatted(date: .omitted, time: .standard)
+        append(.error, "💥 \(report.processName) crashed on \(device.name) at \(time): \(report.exceptionType)")
+        for reason in report.reasons { append(.error, reason) }
+        for frame in report.frameLines() { append(.info, frame) }
+        append(.info, "Crash report: \(file.path)")
+        Notifier.post(title: "\(report.processName) crashed on \(device.name)",
+                      body: report.reasons.first ?? report.exceptionType)
     }
 
     /// Removes Orchard's checkout and build products for this pipeline.

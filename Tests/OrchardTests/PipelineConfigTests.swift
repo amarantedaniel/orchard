@@ -29,6 +29,18 @@ struct PipelineConfigTests {
         #expect(decoded == config)
     }
 
+    @Test func decodesConfigSavedBeforeCrashReporting() throws {
+        let saved = """
+        {"id":"6F1D3C1E-2B7A-4C1D-9A55-0E5F2B9C8D11","name":"POC","repoPath":"/tmp/repo","branch":"main",
+         "scheme":"App","configuration":"Debug","devices":[],"pollInterval":60,"isEnabled":true,
+         "lastDeployedCommit":"4a78b7fc"}
+        """
+        let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(saved.utf8))
+        #expect(config.name == "POC")
+        #expect(config.deployedApps == nil)
+        #expect(config.crashesCheckedUntil == nil)
+    }
+
     @Test func shortSHA() {
         #expect("0123456789abcdef".shortSHA == "01234567")
         #expect("abc".shortSHA == "abc")
