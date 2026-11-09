@@ -38,6 +38,12 @@ final class PipelineRunner: Identifiable {
             guard config != oldValue else { return }
             onChange?()
             if config.isEnabled != oldValue.isEnabled { config.isEnabled ? start() : stop() }
+            if config.scheme != oldValue.scheme || config.containerPath != oldValue.containerPath
+                || config.repoPath != oldValue.repoPath {
+                // The deployed app no longer belongs to this pipeline's build; the next run sets it.
+                config.deployedApps = nil
+                config.crashesSince = nil
+            }
             if config.keptRuns < oldValue.keptRuns {
                 runs = Array(runs.prefix(config.keptRuns))
                 log = log.keepingRuns(config.keptRuns)
@@ -91,7 +97,7 @@ final class PipelineRunner: Identifiable {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.check(force: false)
-                await self.checkCrashes()
+                self.startCrashCheck()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -293,9 +299,7 @@ final class PipelineRunner: Identifiable {
             let platforms = Set(installed.map(\.platform))
             self.config.deployedApps = (self.config.deployedApps ?? []).filter { !platforms.contains($0.platform) }
                 + installed
-            // Crashes of this build count from the start of the run, so a crash right at launch
-            // is caught; earlier ones were checked by previous polls.
-            self.config.crashesCheckedUntil = max(self.config.crashesCheckedUntil ?? runStart, runStart)
+            if self.config.crashesSince == nil { self.config.crashesSince = runStart }
         }
         update { $0.finishedAt = Date() }
         logFile.close()
@@ -303,28 +307,56 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Crashes
 
-    /// Logs crash reports of the deployed app that appeared on any device since the last check.
-    private func checkCrashes() async {
-        guard !isCheckingCrashes, let apps = config.deployedApps, !apps.isEmpty,
-              let since = config.crashesCheckedUntil else { return }
+    /// Starts a crash check in its own task, so devices that are slow to answer don't hold up
+    /// polling. Skipped while a run is building or deploying the app the check would read.
+    private func startCrashCheck() {
+        guard !isCheckingCrashes, runTask == nil, config.deployedApps?.isEmpty == false else { return }
         isCheckingCrashes = true
-        defer { isCheckingCrashes = false }
-
-        let folder = Paths.logs.appendingPathComponent("\(config.id.uuidString)/crashes", isDirectory: true)
-        var newest = since
-        for device in config.devices {
-            guard let app = apps.first(where: { $0.platform == device.platform }) else { continue }
-            let found = await CrashReports.newReports(
-                on: device, executable: app.executableName, since: since, into: folder)
-            for (report, file) in found {
-                let symbolicated = await CrashReports.symbolicate(report, app: URL(fileURLWithPath: app.appPath))
-                logCrash(symbolicated, on: device, file: file)
-                newest = max(newest, report.timestamp)
-            }
+        Task {
+            await checkCrashes()
+            isCheckingCrashes = false
         }
-        // Only advanced to the newest report: a report is written a few seconds after its crash,
-        // so advancing to "now" could skip one still being written.
-        if newest > since { config.crashesCheckedUntil = newest }
+    }
+
+    /// Logs crash reports of the deployed app that appeared on any device and weren't logged yet.
+    private func checkCrashes() async {
+        guard let apps = config.deployedApps else { return }
+        let since: Date
+        if let crashesSince = config.crashesSince {
+            since = crashesSince
+        } else {
+            since = Date()
+            config.crashesSince = since
+        }
+        let reported = Set(config.reportedCrashes ?? [])
+        let folder = Paths.logs.appendingPathComponent("\(config.id.uuidString)/crashes", isDirectory: true)
+        let targets = config.devices.compactMap { device in
+            apps.first { $0.platform == device.platform }.map { (device, $0) }
+        }
+
+        let found = await withTaskGroup(of: [(CrashReport, URL, String, Device, DeployedApp)].self) { group in
+            for (device, app) in targets {
+                group.addTask {
+                    await CrashReports.newReports(
+                        on: device, executable: app.executableName, since: since,
+                        reported: reported, into: folder)
+                        .map { ($0.report, $0.file, $0.key, device, app) }
+                }
+            }
+            var all: [(CrashReport, URL, String, Device, DeployedApp)] = []
+            for await reports in group { all += reports }
+            return all
+        }
+
+        var logged: [String] = []
+        for (report, file, key, device, app) in found.sorted(by: { $0.0.timestamp < $1.0.timestamp }) {
+            let symbolicated = await CrashReports.symbolicate(report, app: URL(fileURLWithPath: app.appPath))
+            logCrash(symbolicated, on: device, file: file)
+            logged.append(key)
+        }
+        if !logged.isEmpty {
+            config.reportedCrashes = Array(((config.reportedCrashes ?? []) + logged).suffix(CrashReports.reportedLimit))
+        }
     }
 
     private func logCrash(_ report: CrashReport, on device: Device, file: URL) {

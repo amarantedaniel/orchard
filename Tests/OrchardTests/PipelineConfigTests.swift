@@ -38,7 +38,8 @@ struct PipelineConfigTests {
         let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(saved.utf8))
         #expect(config.name == "POC")
         #expect(config.deployedApps == nil)
-        #expect(config.crashesCheckedUntil == nil)
+        #expect(config.crashesSince == nil)
+        #expect(config.reportedCrashes == nil)
     }
 
     @Test func shortSHA() {

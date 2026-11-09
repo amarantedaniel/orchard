@@ -24,7 +24,7 @@ struct CrashReportsTests {
             ]}
           ],
           "usedImages" : [
-            {"base":4294967296,"name":"FlightradarFree.debug.dylib","path":"/private/var/containers/Bundle/Application/X/FlightradarFree.app/FlightradarFree.debug.dylib"},
+            {"base":4294967296,"uuid":"4E98637A-8420-307A-8118-63D18BDCD4B3","name":"FlightradarFree.debug.dylib","path":"/private/var/containers/Bundle/Application/X/FlightradarFree.app/FlightradarFree.debug.dylib"},
             {"base":6442450944,"name":"libswiftCore.dylib","path":"/usr/lib/swift/libswiftCore.dylib"}
           ]
         }
@@ -42,6 +42,7 @@ struct CrashReportsTests {
             "0  FlightradarFree.debug.dylib  0x100001000",
             "1  libswiftCore.dylib  _assertionFailure(_:_:file:line:flags:) + 208",
         ])
+        #expect(report.frames[0].imageUUID == "4e98637a-8420-307a-8118-63d18bdcd4b3")
         #expect(report.frames[0].imagePath?.hasSuffix("FlightradarFree.app/FlightradarFree.debug.dylib") == true)
     }
 
@@ -86,8 +87,60 @@ struct CrashReportsTests {
         ]}}
         """
         let since = Date(timeIntervalSince1970: 1_794_217_200) // 2026-11-09 09:40:00 UTC
-        #expect(CrashReports.crashFiles(inListing: Data(listing.utf8), executable: "FlightradarFree", since: since)
+        #expect(CrashReports.crashFiles(inListing: Data(listing.utf8), executable: "FlightradarFree",
+                                        device: Self.phone, since: since, reported: [])
             == ["FlightradarFree-2026-11-09-104102.ips"])
+    }
+
+    static let phone = Device(id: "00008120-000118363C10A01E", name: "Nokia 5120", model: "iPhone 15",
+                              kind: .physical, platform: .iOS, osVersion: "27.0")
+
+    /// Reports are deduplicated by file, not by time, so a report found late (device asleep,
+    /// report still being written) is still logged, and one already logged never is again.
+    @Test func skipsReportsAlreadyLoggedButNotLateOnes() {
+        let listing = """
+        {"result":{"files":[
+          {"relativePath":"FlightradarFree-2026-11-09-104102.ips",
+           "metadata":{"lastModDate":"2026-11-09T09:41:03.000Z","extendedAttributes":{"bug_type":"309"}}},
+          {"relativePath":"FlightradarFree-2026-11-09-104102.000.ips",
+           "metadata":{"lastModDate":"2026-11-09T09:41:03.000Z","extendedAttributes":{"bug_type":"309"}}},
+          {"relativePath":"FlightradarFree-2026-11-09-105000.ips",
+           "metadata":{"lastModDate":"2026-11-09T09:50:00.000Z","extendedAttributes":{"bug_type":"309"}}}
+        ]}}
+        """
+        let since = Date(timeIntervalSince1970: 1_794_217_200)
+        let reported: Set = [CrashReports.key(device: Self.phone, fileName: "FlightradarFree-2026-11-09-105000.ips")]
+        #expect(CrashReports.crashFiles(inListing: Data(listing.utf8), executable: "FlightradarFree",
+                                        device: Self.phone, since: since, reported: reported)
+            == ["FlightradarFree-2026-11-09-104102.ips", "FlightradarFree-2026-11-09-104102.000.ips"])
+    }
+
+    @Test func keysReportsPerDevice() {
+        #expect(CrashReports.key(device: Self.phone, fileName: "Retired/App-2026-11-09-104102.ips")
+            == "00008120-000118363C10A01E/App-2026-11-09-104102.ips")
+        #expect(CrashReports.key(device: .thisMac, fileName: "App-2026-11-09-104102.ips")
+            != CrashReports.key(device: Self.phone, fileName: "App-2026-11-09-104102.ips"))
+    }
+
+    @Test func mapsAtosOutputToFramesIgnoringWarnings() {
+        let output = """
+        atos[123]: warning: unable to load symbols for some image
+        MapViewController.viewDidLoad() (in FlightradarFree.debug.dylib) (MapViewController.swift:42)
+        0x100002000
+        """
+        #expect(CrashReports.atosSymbols(output, count: 2) == [
+            "MapViewController.viewDidLoad() (in FlightradarFree.debug.dylib) (MapViewController.swift:42)", nil,
+        ])
+        #expect(CrashReports.atosSymbols(output, count: 3) == nil)
+    }
+
+    @Test func readsUUIDsFromDwarfdump() {
+        let output = """
+        UUID: 4E98637A-8420-307A-8118-63D18BDCD4B3 (arm64) /path/FlightradarFree.debug.dylib
+        UUID: D753CBA8-F4ED-3813-B91C-C6F04918FCF4 (x86_64) /path/FlightradarFree.debug.dylib
+        """
+        #expect(CrashReports.dwarfdumpUUIDs(output)
+            == ["4e98637a-8420-307a-8118-63d18bdcd4b3", "d753cba8-f4ed-3813-b91c-c6f04918fcf4"])
     }
 
     @Test func attributesSimulatorCrashesByUDID() throws {

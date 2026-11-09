@@ -6,6 +6,8 @@ struct CrashReport: Sendable, Equatable {
         var image: String
         var imagePath: String?
         var imageBase: UInt64?
+        /// The image's Mach-O UUID, lowercase with dashes as in the report.
+        var imageUUID: String?
         var imageOffset: UInt64
         var symbol: String?
         var symbolLocation: Int?
@@ -67,6 +69,7 @@ struct CrashReport: Sendable, Equatable {
                 image: image?["name"] as? String ?? "???",
                 imagePath: image?["path"] as? String,
                 imageBase: (image?["base"] as? NSNumber)?.uint64Value,
+                imageUUID: (image?["uuid"] as? String)?.lowercased(),
                 imageOffset: (raw["imageOffset"] as? NSNumber)?.uint64Value ?? 0,
                 symbol: raw["symbol"] as? String,
                 symbolLocation: raw["symbolLocation"] as? Int)
@@ -116,9 +119,17 @@ struct CrashReport: Sendable, Equatable {
 
 /// Finds new crash reports of a deployed app on a device.
 enum CrashReports {
+    /// How many logged report keys a pipeline remembers.
+    static let reportedLimit = 500
+
     /// Mac-side folder where this Mac and simulators write crash reports.
     static let macReportsDirectory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/DiagnosticReports", isDirectory: true)
+
+    /// Identifies one report on one device, so it's logged once however late it's found.
+    static func key(device: Device, fileName: String) -> String {
+        "\(device.id)/\((fileName as NSString).lastPathComponent)"
+    }
 
     /// Reports are named "<executable>-<date>.ips" (a ".000" suffix for same-second duplicates).
     /// Resource reports ("<executable>.cpu_resource-<date>.ips") don't match the dash.
@@ -127,8 +138,10 @@ enum CrashReports {
         return name.hasPrefix("\(executable)-") && name.hasSuffix(".ips")
     }
 
-    /// Crash files in a `devicectl device info files --json-output` listing, modified after `since`.
-    static func crashFiles(inListing data: Data, executable: String, since: Date) -> [String] {
+    /// Crash files in a `devicectl device info files --json-output` listing that were written
+    /// after `since` and aren't in `reported`.
+    static func crashFiles(inListing data: Data, executable: String, device: Device,
+                           since: Date, reported: Set<String>) -> [String] {
         struct Listing: Decodable {
             struct Result: Decodable { var files: [File] }
             struct File: Decodable {
@@ -146,6 +159,7 @@ enum CrashReports {
         dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return listing.result.files.compactMap { file in
             guard isReport(fileName: file.relativePath, of: executable),
+                  !reported.contains(key(device: device, fileName: file.relativePath)),
                   file.metadata?.extendedAttributes?["bug_type"].map({ $0 == CrashReport.crashBugType }) ?? true,
                   let modified = file.metadata?.lastModDate.flatMap(dates.date(from:)),
                   modified > since
@@ -154,29 +168,28 @@ enum CrashReports {
         }
     }
 
-    /// Crash reports of `executable` on `device` timestamped after `since`, oldest first, each
-    /// with the local copy of its `.ips` (fetched into `folder` for physical devices). Errors,
-    /// like a disconnected device, yield no reports: the next poll tries again.
-    static func newReports(on device: Device, executable: String, since: Date,
-                           into folder: URL) async -> [(report: CrashReport, file: URL)] {
+    /// Crash reports of `executable` on `device` written after `since` and not in `reported`,
+    /// oldest first, each with its local `.ips` (fetched into `folder` for physical devices) and
+    /// its `key`. Errors, like a disconnected device, yield no reports: the next poll tries again.
+    static func newReports(on device: Device, executable: String, since: Date, reported: Set<String>,
+                           into folder: URL) async -> [(report: CrashReport, file: URL, key: String)] {
         let candidates: [URL]
         switch device.kind {
         case .physical:
-            candidates = await fetchFromDevice(device, executable: executable, since: since, into: folder)
+            candidates = await fetchFromDevice(device, executable: executable, since: since,
+                                               reported: reported, into: folder)
         case .simulator, .thisMac:
-            candidates = macReports(of: executable, since: since)
+            candidates = macReports(of: executable, device: device, since: since, reported: reported)
         }
         return candidates
-            .compactMap { url -> (CrashReport, URL)? in
+            .compactMap { url -> (report: CrashReport, file: URL, key: String)? in
                 guard let text = try? String(contentsOf: url, encoding: .utf8),
                       let report = CrashReport.parse(text),
-                      report.timestamp > since,
                       belongs(report, to: device)
                 else { return nil }
-                return (report, url)
+                return (report, url, key(device: device, fileName: url.lastPathComponent))
             }
-            .sorted { $0.0.timestamp < $1.0.timestamp }
-            .map { (report: $0.0, file: $0.1) }
+            .sorted { $0.report.timestamp < $1.report.timestamp }
     }
 
     /// Simulator crashes land in the same folder as this Mac's, tagged with the simulator's UDID.
@@ -189,18 +202,21 @@ enum CrashReports {
         }
     }
 
-    private static func macReports(of executable: String, since: Date) -> [URL] {
+    private static func macReports(of executable: String, device: Device, since: Date,
+                                   reported: Set<String>) -> [URL] {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: macReportsDirectory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
         return files.filter { url in
-            guard isReport(fileName: url.lastPathComponent, of: executable) else { return false }
+            guard isReport(fileName: url.lastPathComponent, of: executable),
+                  !reported.contains(key(device: device, fileName: url.lastPathComponent))
+            else { return false }
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             return modified.map { $0 > since } ?? true
         }
     }
 
     private static func fetchFromDevice(_ device: Device, executable: String, since: Date,
-                                        into folder: URL) async -> [URL] {
+                                        reported: Set<String>, into folder: URL) async -> [URL] {
         let fileManager = FileManager.default
         try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         let listingURL = fileManager.temporaryDirectory
@@ -217,7 +233,9 @@ enum CrashReports {
         guard let data = try? Data(contentsOf: listingURL) else { return [] }
 
         var copies: [URL] = []
-        for source in crashFiles(inListing: data, executable: executable, since: since) {
+        let sources = crashFiles(inListing: data, executable: executable, device: device,
+                                 since: since, reported: reported)
+        for source in sources {
             let destination = folder.appendingPathComponent((source as NSString).lastPathComponent)
             if !fileManager.fileExists(atPath: destination.path) {
                 do {
@@ -236,7 +254,8 @@ enum CrashReports {
 
     /// Fills in symbols for frames in the deployed app's own binaries (the app executable and,
     /// in Debug builds, its `.debug.dylib`), which device crash reports leave as raw addresses.
-    /// Best effort: frames atos can't resolve stay as they were.
+    /// A binary is used only when its UUID matches the report's image, because the build folder
+    /// may already hold a newer build. Best effort: unresolved frames stay as they were.
     static func symbolicate(_ report: CrashReport, app: URL) async -> CrashReport {
         let bundleName = app.lastPathComponent
         var result = report
@@ -247,21 +266,44 @@ enum CrashReports {
         for indices in unresolved.values {
             let first = report.frames[indices[0]]
             guard let binary = localBinary(for: first, app: app, bundleName: bundleName),
-                  let base = first.imageBase else { continue }
+                  let base = first.imageBase,
+                  let uuid = first.imageUUID,
+                  let dump = try? await Shell.run("/usr/bin/dwarfdump", ["--uuid", binary.path]),
+                  dwarfdumpUUIDs(dump).contains(uuid)
+            else { continue }
             let addresses = indices.compactMap { report.frames[$0].address }.map { "0x" + String($0, radix: 16) }
             guard addresses.count == indices.count,
                   let output = try? await Shell.run(
-                    "/usr/bin/atos", ["-o", binary.path, "-l", "0x" + String(base, radix: 16)] + addresses)
+                    "/usr/bin/atos", ["-o", binary.path, "-l", "0x" + String(base, radix: 16)] + addresses),
+                  let symbols = atosSymbols(output, count: addresses.count)
             else { continue }
-            let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            for (index, line) in zip(indices, lines) {
-                let symbol = line.trimmingCharacters(in: .whitespaces)
-                guard !symbol.isEmpty, !symbol.hasPrefix("0x") else { continue }
+            for (index, symbol) in zip(indices, symbols) {
+                guard let symbol else { continue }
                 result.frames[index].symbol = symbol
                 result.frames[index].symbolLocation = nil
             }
         }
         return result
+    }
+
+    /// UUIDs in `dwarfdump --uuid` output ("UUID: 4E98637A-… (arm64) /path"), lowercased.
+    static func dwarfdumpUUIDs(_ output: String) -> Set<String> {
+        Set(output.split(separator: "\n").compactMap { line in
+            let words = line.split(separator: " ")
+            guard words.count >= 2, words[0] == "UUID:" else { return nil }
+            return words[1].lowercased()
+        })
+    }
+
+    /// One symbol per address from atos output, nil where atos echoed the address back.
+    /// atos's stderr shares the pipe, so lines that are neither a symbol ("name (in Image)")
+    /// nor an address are warnings and dropped; nil unless exactly `count` lines remain.
+    static func atosSymbols(_ output: String, count: Int) -> [String?]? {
+        let results = output.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.contains(" (in ") || $0.hasPrefix("0x") }
+        guard results.count == count else { return nil }
+        return results.map { $0.hasPrefix("0x") ? nil : $0 }
     }
 
     /// The local file for a frame's image when it lives inside the deployed `.app`.
