@@ -14,6 +14,17 @@ enum DeviceDiscovery {
         return [DiscoveredDevice(device: .thisMac, isConnected: true)] + (await physical) + (await simulators)
     }
 
+    /// Rows for the device list: discovered devices plus selected ones that weren't discovered,
+    /// connected/available ones first. Stable, so each group keeps its order (this Mac, physical
+    /// devices, simulators, then the missing selected devices).
+    static func listRows(discovered: [DiscoveredDevice], selected: [Device]) -> [DiscoveredDevice] {
+        let missing = selected
+            .filter { device in !discovered.contains { $0.id == device.id } }
+            .map { DiscoveredDevice(device: $0, isConnected: false) }
+        let all = discovered + missing
+        return all.filter(\.isConnected) + all.filter { !$0.isConnected }
+    }
+
     private static func physicalDevices() async -> [DiscoveredDevice] {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")
