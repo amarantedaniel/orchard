@@ -113,8 +113,6 @@ struct ContentViewLayoutTests {
 
     /// The settings column with a mix of connected, disconnected and booted simulator devices.
     private func devicesSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
-        let store = makeTestStore()
-        let runner = store.pipelines[0]
         func device(_ id: String, _ name: String, _ model: String, _ kind: DeviceKind,
                     _ platform: BuildPlatform) -> Device {
             Device(id: id, name: name, model: model, kind: kind, platform: platform, osVersion: "26.0")
@@ -124,14 +122,15 @@ struct ContentViewLayoutTests {
         let watch = device("watch", "Apple Watch", "Apple Watch Ultra 3", .physical, .watchOS)
         let simulator = device("sim", "iPhone 17", "iOS 26.0", .simulator, .iOSSimulator)
         let oldPhone = device("old", "Old iPhone", "iPhone 15", .physical, .iOS)
-        store.devices = [
+        let store = AppStore(defaults: nil, discoversDevices: false, devices: [
             DiscoveredDevice(device: Device(id: "this-mac", name: "Mac Studio", model: "This Mac",
                                             kind: .thisMac, platform: .macOS, osVersion: "26.0"), isConnected: true),
             DiscoveredDevice(device: iPhone, isConnected: true),
             DiscoveredDevice(device: iPad, isConnected: false),
             DiscoveredDevice(device: watch, isConnected: false),
             DiscoveredDevice(device: simulator, isConnected: true),
-        ]
+        ])
+        let runner = store.addPipeline()
         runner.config.devices = [iPhone, oldPhone]
         let harness = makeWindow(width: 1100, appearance: appearance, store: store)
         defer { harness.close() }

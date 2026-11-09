@@ -248,11 +248,7 @@ private struct DevicesSection: View {
 
     /// Discovered devices, plus selected ones that aren't currently visible, available ones first.
     private var rows: [DiscoveredDevice] {
-        let discovered = store.devices
-        let missing = runner.config.devices
-            .filter { device in !discovered.contains { $0.id == device.id } }
-            .map { DiscoveredDevice(device: $0, isConnected: false) }
-        return DeviceDiscovery.availableFirst(discovered + missing)
+        DeviceDiscovery.listRows(discovered: store.devices, selected: runner.config.devices)
     }
 
     private func detail(for row: DiscoveredDevice) -> String {
