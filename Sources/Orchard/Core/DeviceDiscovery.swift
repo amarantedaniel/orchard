@@ -14,6 +14,13 @@ enum DeviceDiscovery {
         return [DiscoveredDevice(device: .thisMac, isConnected: true)] + (await physical) + (await simulators)
     }
 
+    /// Order for the device list: connected/available devices first, then the rest.
+    /// Stable, so each group keeps its incoming order (this Mac, physical devices, simulators, then
+    /// selected devices that weren't discovered).
+    static func availableFirst(_ devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
+        devices.filter(\.isConnected) + devices.filter { !$0.isConnected }
+    }
+
     private static func physicalDevices() async -> [DiscoveredDevice] {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")

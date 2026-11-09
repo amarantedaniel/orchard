@@ -5,7 +5,8 @@ import Observation
 @Observable
 final class AppStore {
     private(set) var pipelines: [PipelineRunner] = []
-    private(set) var devices: [DiscoveredDevice] = []
+    /// Set by `refreshDevices()`; settable internally so tests can stage a device list.
+    var devices: [DiscoveredDevice] = []
     private(set) var isRefreshingDevices = false
 
     @ObservationIgnored private let defaults: UserDefaults?
