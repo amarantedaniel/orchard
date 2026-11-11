@@ -124,6 +124,28 @@ struct ProvisioningTests {
         #expect(Provisioning.devicesMissing(fromProfilesIn: none, devices: [device("iPhone", udid: phoneUDID)]).isEmpty)
     }
 
+    @Test func onlyAnXcodeManagedProfileCanBeRefreshed() throws {
+        let phone = device("iPhone", udid: phoneUDID)
+        func app(name: String, managed: Bool, devices: [String]) throws -> (TemporaryDirectory, URL) {
+            let directory = try TemporaryDirectory()
+            try directory.makeDirectories("App.app")
+            let app = directory.url.appendingPathComponent("App.app")
+            try profileData(name: name, devices: devices, managed: managed)
+                .write(to: app.appendingPathComponent("embedded.mobileprovision"))
+            return (directory, app)
+        }
+        let team = try app(name: "iOS Team Provisioning Profile: com.example.app", managed: false, devices: [padUDID])
+        #expect(Provisioning.canRefreshProfiles(in: team.1, missing: [phone]))
+        let managed = try app(name: "XC com example app", managed: true, devices: [padUDID])
+        #expect(Provisioning.canRefreshProfiles(in: managed.1, missing: [phone]))
+        let manual = try app(name: "Example Development", managed: false, devices: [padUDID])
+        #expect(Provisioning.devicesMissing(fromProfilesIn: manual.1, devices: [phone]) == [phone])
+        #expect(!Provisioning.canRefreshProfiles(in: manual.1, missing: [phone]))
+        // A managed profile that lists the device isn't the one at fault.
+        let covering = try app(name: "XC com example app", managed: true, devices: [phoneUDID])
+        #expect(!Provisioning.canRefreshProfiles(in: covering.1, missing: [phone]))
+    }
+
     @Test func messageNamesTheDevice() {
         #expect(Provisioning.unregisteredMessage(for: device("César's iPhone", udid: phoneUDID))
                 == "César's iPhone isn't in the team's provisioning profile; register it in the developer account")

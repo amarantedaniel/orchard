@@ -74,6 +74,16 @@ enum Provisioning {
         }
     }
 
+    /// Whether a profile in `app` that lacks one of `devices` is one Xcode manages, so deleting
+    /// the cached copy and building again can produce a current one. A hand-made profile can't
+    /// be refreshed that way.
+    static func canRefreshProfiles(in app: URL, missing devices: [Device]) -> Bool {
+        let udids = devices.compactMap(\.udid)
+        return embeddedProfiles(in: app).compactMap(profile(at:)).contains { profile in
+            profile.isCachedByXcode && udids.contains { !profile.covers(udid: $0) }
+        }
+    }
+
     /// Deletes the profiles Xcode manages from `directory`, so the next build with
     /// `-allowProvisioningUpdates` downloads current ones. Profiles the developer made by hand
     /// stay. Returns how many were deleted.

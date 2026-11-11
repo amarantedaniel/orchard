@@ -199,8 +199,9 @@ final class PipelineRunner: Identifiable {
                 guard var devices = groups[platform] else { continue }
                 try Task.checkCancellation()
 
-                /// Builds the platform; nil when the build failed, which fails its devices.
-                func buildProduct() async throws -> BuiltProduct? {
+                /// Builds the platform; nil when the build failed, which fails its devices unless
+                /// `failingDevices` is false.
+                func buildProduct(failingDevices: Bool = true) async throws -> BuiltProduct? {
                     let buildStart = Date()
                     defer {
                         timings.build += Date().timeIntervalSince(buildStart)
@@ -218,8 +219,10 @@ final class PipelineRunner: Identifiable {
                     } catch {
                         let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
                         append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
-                        for device in devices {
-                            update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                        if failingDevices {
+                            for device in devices {
+                                update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                            }
                         }
                         raw("BUILD FAILED: \(error.localizedDescription)")
                         return nil
@@ -234,15 +237,25 @@ final class PipelineRunner: Identifiable {
                 // The generic destination gives xcodebuild no reason to refresh a cached profile
                 // that predates a device, so check it here and refresh it once ourselves.
                 if platform.needsDeviceProvisioning {
-                    devices = await DeviceDiscovery.fillingUDIDs(devices)
+                    devices = await rememberingUDIDs(of: devices)
                     let missing = Provisioning.devicesMissing(fromProfilesIn: product.appURL, devices: devices)
-                    if !missing.isEmpty {
-                        let names = missing.map(\.name).joined(separator: ", ")
+                    // Building again only helps when the profile is one Xcode will download anew.
+                    if !missing.isEmpty, Provisioning.canRefreshProfiles(in: product.appURL, missing: missing) {
                         let removed = Provisioning.removeXcodeManagedProfiles()
-                        append(.warning, "The provisioning profile doesn't include \(names). Removed \(removed) cached Xcode-managed profile(s); building again")
-                        try Task.checkCancellation()
-                        guard let rebuilt = try await buildProduct() else { continue }
-                        product = rebuilt
+                        if removed > 0 {
+                            let names = missing.map(\.name).joined(separator: ", ")
+                            append(.warning, "The provisioning profile doesn't include \(names). Removed \(removed) cached Xcode-managed profile(s); building again")
+                            try Task.checkCancellation()
+                            if let rebuilt = try await buildProduct(failingDevices: false) {
+                                product = rebuilt
+                            } else if !FileManager.default.fileExists(atPath: product.appURL.path) {
+                                for device in devices {
+                                    update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                                }
+                                continue
+                            }
+                            // Otherwise the first build is still there for the devices it covers.
+                        }
                     }
                 }
                 update { $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 } }
@@ -320,7 +333,7 @@ final class PipelineRunner: Identifiable {
             guard let index = runs.firstIndex(where: { $0.id == run.id }) else { return }
             change(&runs[index])
         }
-        let device = await DeviceDiscovery.fillingUDIDs([device]).first ?? device
+        let device = await rememberingUDIDs(of: [device]).first ?? device
         let logFile = run.logFile.flatMap(LogFile.init(appendingTo:))
         defer { logFile?.close() }
         let raw: @Sendable (String) -> Void
@@ -346,6 +359,17 @@ final class PipelineRunner: Identifiable {
             config.lastDeployedCommit = run.commit
             config.lastDeployedAt = Date()
         }
+    }
+
+    /// `devices` with their hardware UDIDs, saving the ones found for devices chosen before
+    /// Orchard stored them, so devicectl is asked only once.
+    private func rememberingUDIDs(of devices: [Device]) async -> [Device] {
+        let filled = await DeviceDiscovery.fillingUDIDs(devices)
+        for device in filled where device.udid != nil {
+            guard let index = config.devices.firstIndex(where: { $0.id == device.id && $0.udid == nil }) else { continue }
+            config.devices[index].udid = device.udid
+        }
+        return filled
     }
 
     /// Installs and launches `product` on `device`, reporting its outcome as it goes. A device
