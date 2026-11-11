@@ -128,6 +128,11 @@ final class Updater {
     @ObservationIgnored private let failedKey = "failedUpdateTag"
     @ObservationIgnored private var isPrompting = false
     @ObservationIgnored private var started = false
+    /// Set by "Install and Relaunch" while an automatic install waits for pipelines: don't wait.
+    @ObservationIgnored private var installNow = false
+    /// Releases a background check already showed the window for, so the hourly checks of
+    /// automatic installs that can't replace the app don't bring it back after "Later".
+    @ObservationIgnored private var promptedTags: Set<String> = []
     /// Whether a pipeline is building or deploying, so the alert can warn that updating stops it.
     @ObservationIgnored var isBusy: () -> Bool = { false }
 
@@ -197,8 +202,10 @@ final class Updater {
                 skipped: defaults?.string(forKey: skippedKey), failed: defaults?.string(forKey: failedKey))
             switch action {
             case .none: break
-            case .prompt: prompt(release)
-            case .install: await install(release, unattended: true)
+            case .prompt:
+                if userInitiated || promptedTags.insert(release.tagName).inserted { prompt(release) }
+            case .install:
+                await install(release, unattended: true)
             }
         }
     }
@@ -261,7 +268,9 @@ final class Updater {
             isPrompting = false
             switch choice {
             case .install:
-                if canInstall {
+                if state == .installing {
+                    installNow = true  // An automatic install is waiting for pipelines.
+                } else if canInstall {
                     Task { await self.install(release) }
                 } else {
                     NSWorkspace.shared.open(release.htmlURL)
@@ -324,12 +333,18 @@ final class Updater {
     private func install(_ release: Release, unattended: Bool = false) async {
         guard state == .idle, let destination = Self.installLocation(), let dmg = release.dmg else { return }
         state = .installing
+        installNow = false
+        var work: URL?
         do {
             let staged = try await Self.download(dmg.browserDownloadURL, expecting: release.version)
+            work = staged.deletingLastPathComponent()
             if unattended {
-                await Self.waitUntilIdle(isBusy)
+                if isBusy() { NSLog("Orchard: %@ is ready; waiting for pipelines to finish", release.tagName) }
+                await Self.waitUntilIdle { [self] in !installNow && isBusy() }
                 reloadSettings()
-                guard installsAutomatically else {  // Turned off while waiting.
+                // Turned off, or this version skipped, while waiting.
+                let wanted = installsAutomatically && defaults?.string(forKey: skippedKey) != release.tagName
+                guard installNow || wanted else {
                     try? FileManager.default.removeItem(at: staged.deletingLastPathComponent())
                     state = .idle
                     return
@@ -339,6 +354,7 @@ final class Updater {
             defaults?.set(release.tagName, forKey: pendingKey)
             NSApp.terminate(nil)
         } catch {
+            if let work { try? FileManager.default.removeItem(at: work) }
             state = .idle
             if unattended {
                 NSLog("Orchard: couldn't install %@ automatically: %@", release.tagName, error.localizedDescription)

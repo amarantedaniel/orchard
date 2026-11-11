@@ -26,7 +26,7 @@ On a Mac nobody sits at (a build machine you reach over SSH or screen sharing), 
 defaults write se.ambi.Orchard automaticallyInstallUpdates -bool YES
 ```
 
-Orchard then checks for a release every hour and installs it without asking. It waits for running builds and deploys to finish first, and relaunches with the same pipelines enabled. It's off by default. A version you skipped stays skipped, and a release that failed to install isn't tried again.
+Orchard then checks for a release every hour and installs it without asking. It waits for running builds and deploys to finish first, and relaunches with the same pipelines enabled. It's off by default, and a `defaults write` on a running Orchard takes effect within the hour. A version you skipped stays skipped. A download that fails is tried again at the next check; a release that downloaded but couldn't replace the app isn't.
 
 ## Using it
 
