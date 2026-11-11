@@ -51,6 +51,9 @@ enum BuildPlatform: String, Codable, Hashable, CaseIterable, Sendable {
 
     var isSimulator: Bool { rawValue.hasSuffix("Simulator") }
 
+    /// Whether apps for this platform are signed with a profile that lists the devices they run on.
+    var needsDeviceProvisioning: Bool { !isSimulator && self != .macOS }
+
     /// Maps devicectl / simctl platform names (`iOS`, `xrOS`, …) to a build platform.
     init?(devicePlatform: String, simulator: Bool) {
         switch (devicePlatform.lowercased(), simulator) {
@@ -83,6 +86,9 @@ struct Device: Codable, Hashable, Identifiable, Sendable {
     var kind: DeviceKind
     var platform: BuildPlatform
     var osVersion: String
+    /// Hardware UDID of a physical device, as provisioning profiles list it (`id` is devicectl's
+    /// own identifier). Optional so devices saved before it existed decode.
+    var udid: String?
 
     static let thisMac = Device(
         id: "this-mac",
@@ -189,16 +195,25 @@ struct RunRecord: Identifiable, Sendable, Codable {
     var deviceOutcomes: [String: DeployOutcome] = [:]
     var logFile: URL?
     var timings: RunTimings?
+    /// The apps this run built, by `BuildPlatform` raw value, while they're still in DerivedData:
+    /// building a platform again overwrites its app, so a newer run removes it from older ones.
+    /// Optional so older saved runs decode.
+    var products: [String: BuiltProduct]?
+
+    func product(for platform: BuildPlatform) -> BuiltProduct? { products?[platform.rawValue] }
 
     /// A run saved while still going, which Orchard quit in the middle of.
     func interruptedIfUnfinished() -> RunRecord {
         guard outcome == .running else { return self }
         var run = self
         run.outcome = .failed("Interrupted")
-        run.deviceOutcomes = deviceOutcomes.mapValues {
-            $0 == .running || $0 == .pending ? .failed("Interrupted") : $0
-        }
+        run.markUnfinishedDevices(.failed("Interrupted"))
         return run
+    }
+
+    /// Gives devices the run never finished with `outcome`, so they count as failed.
+    mutating func markUnfinishedDevices(_ outcome: DeployOutcome) {
+        deviceOutcomes = deviceOutcomes.mapValues { $0 == .running || $0 == .pending ? outcome : $0 }
     }
 
     /// The run's outcome once every device is done: failed if any device failed, otherwise a
@@ -214,6 +229,27 @@ struct RunRecord: Identifiable, Sendable, Codable {
             return .warning("Installed, but failed to launch on \(notLaunched.map(\.name).joined(separator: ", "))")
         }
         return .succeeded
+    }
+}
+
+extension DeployOutcome {
+    /// A device that didn't end up with the app running, so deploying again may help.
+    var canRetry: Bool {
+        switch self {
+        case .failed, .warning: true
+        default: false
+        }
+    }
+}
+
+extension [RunRecord] {
+    /// Drops the apps of every run but `keeping`, because a new build overwrites what DerivedData
+    /// holds: not just its own platform's app, but embedded ones too (an iOS build writes its
+    /// watch app to the watchOS products folder).
+    mutating func forgetProducts(keeping id: RunRecord.ID) {
+        for index in indices where self[index].id != id && self[index].products != nil {
+            self[index].products = nil
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-struct BuiltProduct: Sendable {
+struct BuiltProduct: Hashable, Sendable, Codable {
     var appURL: URL
     var bundleIdentifier: String
 
@@ -77,7 +77,7 @@ enum Xcode {
             "-destination", platform.genericDestination,
             "-derivedDataPath", derivedData.path,
         ]
-        if !platform.isSimulator && platform != .macOS {
+        if platform.needsDeviceProvisioning {
             common += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
         }
 

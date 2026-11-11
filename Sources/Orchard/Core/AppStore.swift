@@ -5,7 +5,7 @@ import Observation
 @Observable
 final class AppStore {
     private(set) var pipelines: [PipelineRunner] = []
-    private(set) var devices: [DiscoveredDevice] = []
+    private(set) var devices: [DiscoveredDevice]
     private(set) var isRefreshingDevices = false
 
     @ObservationIgnored private let defaults: UserDefaults?
@@ -13,9 +13,11 @@ final class AppStore {
     @ObservationIgnored private var activity: NSObjectProtocol?
 
     /// Tests pass `defaults: nil` to keep pipelines in memory, so they never read or overwrite
-    /// the user's pipelines, and `discoversDevices: false` so they don't depend on the host's devices.
-    init(defaults: UserDefaults? = .standard, discoversDevices: Bool = true) {
+    /// the user's pipelines, and `discoversDevices: false` so they don't depend on the host's devices
+    /// (optionally staging `devices` instead).
+    init(defaults: UserDefaults? = .standard, discoversDevices: Bool = true, devices: [DiscoveredDevice] = []) {
         self.defaults = defaults
+        self.devices = devices
         let configs = defaults?.data(forKey: defaultsKey)
             .flatMap { try? JSONDecoder().decode([PipelineConfig].self, from: $0) } ?? []
         pipelines = configs.map(makeRunner)

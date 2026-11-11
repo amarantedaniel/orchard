@@ -83,6 +83,8 @@ struct ContentViewLayoutTests {
                 try harness.snapshot(to: directory.appendingPathComponent("\(state)-\(name).png"))
             }
 
+            try devicesSnapshot(appearance: appearance, to: directory.appendingPathComponent("devices-\(name).png"))
+
             let store = makeTestStore()
             let runner = store.pipelines[0]
             let iPhone = Device(id: "iphone", name: "iPhone", model: "iPhone 17 Pro", kind: .physical,
@@ -106,7 +108,59 @@ struct ContentViewLayoutTests {
             }
             harness.settle()
             try harness.snapshot(to: directory.appendingPathComponent("deploys-expanded-\(name).png"))
+
+            try redeploySnapshot(appearance: appearance, to: directory.appendingPathComponent("redeploy-\(name).png"))
         }
+    }
+
+    /// A deploy that failed on one of two devices, whose build can be deployed to it again.
+    private func redeploySnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        let dir = try TemporaryDirectory()
+        try dir.makeDirectories("App.app")
+        let phone = Device(id: "iphone", name: "iPhone", model: "iPhone 17 Pro", kind: .physical,
+                           platform: .iOS, osVersion: "26.0")
+        let pad = Device(id: "ipad", name: "iPad Pro", model: "iPad Pro", kind: .physical,
+                         platform: .iOS, osVersion: "26.0")
+        let store = makeTestStore()
+        let runner = store.pipelines[0]
+        runner.config.devices = [phone, pad]
+        var runs = sampleRuns(device: phone.id)
+        runs[0].outcome = .failed("1 of 2 device(s) failed")
+        runs[0].deviceOutcomes = [phone.id: .failed("The device is not connected."), pad.id: .succeeded]
+        runs[0].products = [BuildPlatform.iOS.rawValue: BuiltProduct(
+            appURL: dir.url.appendingPathComponent("App.app"), bundleIdentifier: "com.example.app")]
+        runner.runs = runs
+        let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
+    }
+
+    /// The settings column with a mix of connected, disconnected and booted simulator devices.
+    private func devicesSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        func device(_ id: String, _ name: String, _ model: String, _ kind: DeviceKind,
+                    _ platform: BuildPlatform) -> Device {
+            Device(id: id, name: name, model: model, kind: kind, platform: platform, osVersion: "26.0")
+        }
+        let iPhone = device("iphone", "César's iPhone", "iPhone 17 Pro", .physical, .iOS)
+        let iPad = device("ipad", "iPad", "iPad Pro", .physical, .iOS)
+        let watch = device("watch", "Apple Watch", "Apple Watch Ultra 3", .physical, .watchOS)
+        let simulator = device("sim", "iPhone 17", "iOS 26.0", .simulator, .iOSSimulator)
+        let oldPhone = device("old", "Old iPhone", "iPhone 15", .physical, .iOS)
+        let store = AppStore(defaults: nil, discoversDevices: false, devices: [
+            DiscoveredDevice(device: Device(id: "this-mac", name: "Mac Studio", model: "This Mac",
+                                            kind: .thisMac, platform: .macOS, osVersion: "26.0"), isConnected: true),
+            DiscoveredDevice(device: iPhone, isConnected: true),
+            DiscoveredDevice(device: iPad, isConnected: false),
+            DiscoveredDevice(device: watch, isConnected: false),
+            DiscoveredDevice(device: simulator, isConnected: true),
+        ])
+        let runner = store.addPipeline()
+        runner.config.devices = [iPhone, simulator, oldPhone]
+        let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
     }
 
     private func sampleRuns(device: String) -> [RunRecord] {
