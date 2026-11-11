@@ -131,7 +131,7 @@ struct ContentViewLayoutTests {
             DiscoveredDevice(device: simulator, isConnected: true),
         ])
         let runner = store.addPipeline()
-        runner.config.devices = [iPhone, oldPhone]
+        runner.config.devices = [iPhone, simulator, oldPhone]
         let harness = makeWindow(width: 1100, appearance: appearance, store: store)
         defer { harness.close() }
         harness.window.title = runner.config.name
