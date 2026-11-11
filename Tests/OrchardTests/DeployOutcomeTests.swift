@@ -52,4 +52,48 @@ struct DeployOutcomeTests {
         #expect(DeployError.launchFailed("the device was locked").localizedDescription
             == "Installed, but failed to launch: the device was locked")
     }
+
+    @Test func aNewBuildForgetsOlderRunsAppForThatPlatform() {
+        let app = BuiltProduct(appURL: URL(fileURLWithPath: "/tmp/App.app"), bundleIdentifier: "com.example.app")
+        var older = run([:])
+        older.products = [BuildPlatform.iOS.rawValue: app, BuildPlatform.macOS.rawValue: app]
+        var newer = run([:])
+        newer.products = [BuildPlatform.iOS.rawValue: app]
+        var runs = [newer, older]
+        runs.forgetProducts(for: .iOS, keeping: newer.id)
+        #expect(runs[0].product(for: .iOS) == app)
+        #expect(runs[1].product(for: .iOS) == nil)
+        #expect(runs[1].product(for: .macOS) == app)
+    }
+
+    @Test func runsSavedBeforeProductsStillDecode() throws {
+        let old = #"{"id":"6F9619FF-8B86-D011-B42D-00C04FC964FF","commit":"abc","startedAt":0,"outcome":{"succeeded":{}},"deviceOutcomes":{}}"#
+        let run = try JSONDecoder().decode(RunRecord.self, from: Data(old.utf8))
+        #expect(run.products == nil)
+        #expect(run.product(for: .iOS) == nil)
+    }
+
+    @MainActor
+    @Test func onlyAFailedDeviceWhoseBuildIsStillThereCanBeRedeployed() throws {
+        let dir = try TemporaryDirectory()
+        try dir.makeDirectories("App.app")
+        let app = BuiltProduct(appURL: dir.url.appendingPathComponent("App.app"), bundleIdentifier: "com.example.app")
+        let watch = Device(id: "watch", name: "Watch", model: "Apple Watch", kind: .physical,
+                           platform: .watchOS, osVersion: "26.0")
+        var failed = run([phone.id: .failed("Device not connected"), pad.id: .succeeded,
+                          watch.id: .failed("Build failed")])
+        failed.products = [BuildPlatform.iOS.rawValue: app]
+        failed.finishedAt = Date()
+        let runner = PipelineRunner(config: PipelineConfig())
+        runner.runs = [failed]
+
+        #expect(runner.canRedeploy(phone, from: failed))
+        #expect(!runner.canRedeploy(pad, from: failed))  // Already running the build.
+        #expect(!runner.canRedeploy(watch, from: failed))  // Nothing was built for it.
+        var locked = failed
+        locked.deviceOutcomes[phone.id] = .warning("the device was locked")
+        #expect(runner.canRedeploy(phone, from: locked))
+        try FileManager.default.removeItem(at: app.appURL)
+        #expect(!runner.canRedeploy(phone, from: failed))  // The build is gone.
+    }
 }

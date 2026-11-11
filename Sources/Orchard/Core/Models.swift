@@ -174,6 +174,12 @@ struct RunRecord: Identifiable, Sendable, Codable {
     var deviceOutcomes: [String: DeployOutcome] = [:]
     var logFile: URL?
     var timings: RunTimings?
+    /// The apps this run built, by `BuildPlatform` raw value, while they're still in DerivedData:
+    /// building a platform again overwrites its app, so a newer run removes it from older ones.
+    /// Optional so older saved runs decode.
+    var products: [String: BuiltProduct]?
+
+    func product(for platform: BuildPlatform) -> BuiltProduct? { products?[platform.rawValue] }
 
     /// A run saved while still going, which Orchard quit in the middle of.
     func interruptedIfUnfinished() -> RunRecord {
@@ -199,6 +205,26 @@ struct RunRecord: Identifiable, Sendable, Codable {
             return .warning("Installed, but failed to launch on \(notLaunched.map(\.name).joined(separator: ", "))")
         }
         return .succeeded
+    }
+}
+
+extension DeployOutcome {
+    /// A device that didn't end up with the app running, so deploying again may help.
+    var canRetry: Bool {
+        switch self {
+        case .failed, .warning: true
+        default: false
+        }
+    }
+}
+
+extension [RunRecord] {
+    /// Drops `platform`'s app from every run but `keeping`, because building that platform
+    /// overwrites the one app DerivedData holds for it.
+    mutating func forgetProducts(for platform: BuildPlatform, keeping id: RunRecord.ID) {
+        for index in indices where self[index].id != id && self[index].product(for: platform) != nil {
+            self[index].products?[platform.rawValue] = nil
+        }
     }
 }
 
