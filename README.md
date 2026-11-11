@@ -20,6 +20,14 @@ Every push to `main` builds a DMG (`./scripts/build-dmg.sh`) and publishes it as
 
 Orchard checks for a new release each time it starts. When one is out it shows a small **Update Available** window with a link to the release notes: **Install and Relaunch** downloads the DMG, replaces the app in place and reopens it; **Skip This Version** stops the reminders for that release. **Check for Updates…** is in the app menu and the menu bar menu. Self-updating needs write access to the folder Orchard lives in; otherwise the pop-up links to the download.
 
+On a Mac nobody sits at (a build machine you reach over SSH or screen sharing), turn on **Install Updates Automatically** in the app menu or the menu bar menu, or from a shell:
+
+```bash
+defaults write se.ambi.Orchard automaticallyInstallUpdates -bool YES
+```
+
+Orchard then checks for a release every hour and installs it without asking. It waits for running builds and deploys to finish first, and relaunches with the same pipelines enabled. It's off by default. A version you skipped stays skipped, and a release that failed to install isn't tried again.
+
 ## Using it
 
 1. **+** to add a pipeline, then **Choose…** a local clone of the repo.
