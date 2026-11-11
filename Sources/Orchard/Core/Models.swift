@@ -186,10 +186,13 @@ struct RunRecord: Identifiable, Sendable, Codable {
         guard outcome == .running else { return self }
         var run = self
         run.outcome = .failed("Interrupted")
-        run.deviceOutcomes = deviceOutcomes.mapValues {
-            $0 == .running || $0 == .pending ? .failed("Interrupted") : $0
-        }
+        run.markUnfinishedDevices(.failed("Interrupted"))
         return run
+    }
+
+    /// Gives devices the run never finished with `outcome`, so they count as failed.
+    mutating func markUnfinishedDevices(_ outcome: DeployOutcome) {
+        deviceOutcomes = deviceOutcomes.mapValues { $0 == .running || $0 == .pending ? outcome : $0 }
     }
 
     /// The run's outcome once every device is done: failed if any device failed, otherwise a
@@ -219,11 +222,12 @@ extension DeployOutcome {
 }
 
 extension [RunRecord] {
-    /// Drops `platform`'s app from every run but `keeping`, because building that platform
-    /// overwrites the one app DerivedData holds for it.
-    mutating func forgetProducts(for platform: BuildPlatform, keeping id: RunRecord.ID) {
-        for index in indices where self[index].id != id && self[index].product(for: platform) != nil {
-            self[index].products?[platform.rawValue] = nil
+    /// Drops the apps of every run but `keeping`, because a new build overwrites what DerivedData
+    /// holds: not just its own platform's app, but embedded ones too (an iOS build writes its
+    /// watch app to the watchOS products folder).
+    mutating func forgetProducts(keeping id: RunRecord.ID) {
+        for index in indices where self[index].id != id && self[index].products != nil {
+            self[index].products = nil
         }
     }
 }

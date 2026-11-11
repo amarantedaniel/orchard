@@ -200,7 +200,7 @@ final class PipelineRunner: Identifiable {
                 try Task.checkCancellation()
 
                 status = .building(platform)
-                runs.forgetProducts(for: platform, keeping: record.id)
+                runs.forgetProducts(keeping: record.id)
                 append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
                 let buildStart = Date()
                 let product: BuiltProduct
@@ -262,7 +262,10 @@ final class PipelineRunner: Identifiable {
                               body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
             }
         } catch is CancellationError {
-            update { $0.outcome = .failed("Cancelled") }
+            update {
+                $0.outcome = .failed("Cancelled")
+                $0.markUnfinishedDevices(.failed("Cancelled"))
+            }
             append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
         } catch {
             update { $0.outcome = .failed(error.localizedDescription) }
@@ -303,12 +306,14 @@ final class PipelineRunner: Identifiable {
         if let logFile { raw = logger(file: logFile, condensed: false) } else { raw = { _ in } }
         append(.step, "Deploying \(run.commit.shortSHA) to \(device.name) again")
         do {
-            try await deploy(product, to: device, log: raw) { outcome in
+            try await deploy(product, to: device, log: raw, announce: false) { outcome in
                 update { $0.deviceOutcomes[device.id] = outcome }
             }
         } catch {
-            update { $0.deviceOutcomes[device.id] = .failed("Cancelled") }
+            // Nothing changed on the device that matters; keep what the run recorded.
+            update { $0.deviceOutcomes[device.id] = run.deviceOutcomes[device.id] }
             append(.warning, "Cancelled")
+            return
         }
         guard let updated = runs.first(where: { $0.id == run.id }), updated.finishedAt != nil else { return }
         let devices = config.devices.filter { updated.deviceOutcomes[$0.id] != nil }
@@ -325,10 +330,10 @@ final class PipelineRunner: Identifiable {
     /// Installs and launches `product` on `device`, reporting its outcome as it goes.
     /// Throws only `CancellationError`; a failed deploy is an outcome.
     private func deploy(_ product: BuiltProduct, to device: Device, log: @escaping @Sendable (String) -> Void,
-                        outcome report: (DeployOutcome) -> Void) async throws {
+                        announce: Bool = true, outcome report: (DeployOutcome) -> Void) async throws {
         status = .deploying(device.name)
         report(.running)
-        append(.step, "Deploying to \(device.name)")
+        if announce { append(.step, "Deploying to \(device.name)") }
         let start = Date()
         do {
             try await Deployer.deploy(product, to: device, log: log)

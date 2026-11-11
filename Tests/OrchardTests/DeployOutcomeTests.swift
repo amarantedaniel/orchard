@@ -53,17 +53,27 @@ struct DeployOutcomeTests {
             == "Installed, but failed to launch: the device was locked")
     }
 
-    @Test func aNewBuildForgetsOlderRunsAppForThatPlatform() {
+    @Test func aNewBuildForgetsOlderRunsApps() {
         let app = BuiltProduct(appURL: URL(fileURLWithPath: "/tmp/App.app"), bundleIdentifier: "com.example.app")
         var older = run([:])
-        older.products = [BuildPlatform.iOS.rawValue: app, BuildPlatform.macOS.rawValue: app]
+        // An iOS build can rewrite the watchOS folder too (an embedded watch app), so all go.
+        older.products = [BuildPlatform.iOS.rawValue: app, BuildPlatform.watchOS.rawValue: app]
         var newer = run([:])
         newer.products = [BuildPlatform.iOS.rawValue: app]
         var runs = [newer, older]
-        runs.forgetProducts(for: .iOS, keeping: newer.id)
+        runs.forgetProducts(keeping: newer.id)
         #expect(runs[0].product(for: .iOS) == app)
-        #expect(runs[1].product(for: .iOS) == nil)
-        #expect(runs[1].product(for: .macOS) == app)
+        #expect(runs[1].products == nil)
+    }
+
+    @Test func devicesACancelledRunNeverReachedCountAsFailed() {
+        var cancelled = run([phone.id: .failed("locked"), pad.id: .running, "mac": .pending])
+        cancelled.markUnfinishedDevices(.failed("Cancelled"))
+        #expect(cancelled.deviceOutcomes == [phone.id: .failed("locked"), pad.id: .failed("Cancelled"),
+                                             "mac": .failed("Cancelled")])
+        // So redeploying the phone alone can't make the run look deployed.
+        cancelled.deviceOutcomes[phone.id] = .succeeded
+        #expect(cancelled.finalOutcome(devices: [phone, pad]) == .failed("1 of 2 device(s) failed"))
     }
 
     @Test func runsSavedBeforeProductsStillDecode() throws {
