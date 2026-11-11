@@ -70,7 +70,7 @@ enum Xcode {
             "-destination", platform.genericDestination,
             "-derivedDataPath", derivedData.path,
         ]
-        if !platform.isSimulator && platform != .macOS {
+        if platform.needsDeviceProvisioning {
             common += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
         }
 
